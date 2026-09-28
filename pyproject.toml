@@ -1,0 +1,25 @@
+[project]
+name = "stock-analysis"
+version = "0.1.0"
+description = "Personal proof of concept: quick intraday signal studies on Massive minute bars."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "massive>=2.0",              # official Massive (formerly Polygon.io) client
+    "TA-Lib>=0.6.5",             # PyPI wheels bundle the TA-Lib C library
+    "exchange-calendars>=4.5",   # XNYS sessions, holidays, early closes
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "pyarrow>=15",
+    "matplotlib>=3.8",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false  # a folder of scripts, not an installable package
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
