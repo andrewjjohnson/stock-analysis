@@ -45,12 +45,14 @@ def fetch_minute_bars(ticker, start, end, adjusted=ADJUSTED, client=None):
 
 
 def load_minute_bars(ticker, start, end, *, cache_dir="data/cache", refresh=False,
-                     adjusted=ADJUSTED, expect_through=None, client=None):
+                     adjusted=ADJUSTED, final_close=None, client=None):
     """Return (minute_bars, source) for the request, using the Parquet cache when present.
 
-    expect_through: last session (date) that must appear in a fresh download. If the
-    data stops earlier, the download is treated as truncated: nothing is cached and
-    an error is raised rather than silently studying a shorter interval.
+    final_close: UTC close of the last requested regular session. The SDK pages forward
+    in time and can stop between pages without an error, so a fresh download counts as
+    complete only if it reaches that session's last regular minute (a date check would
+    accept a download cut off mid-session, or holding only pre-market bars). A shorter
+    download raises and is not cached, rather than being studied and re-used.
     """
     path = cache_path(cache_dir, ticker, start, end, adjusted)
     if path.exists() and not refresh:
@@ -59,12 +61,13 @@ def load_minute_bars(ticker, start, end, *, cache_dir="data/cache", refresh=Fals
     df = fetch_minute_bars(ticker, start, end, adjusted, client)
     if df.empty:
         raise RuntimeError(f"Massive returned no minute bars for {ticker} {start}..{end}.")
-    last_day = df["ts"].max().tz_convert("America/New_York").date()
-    if expect_through is not None and last_day < pd.Timestamp(expect_through).date():
+    last_minute = None if final_close is None else pd.Timestamp(final_close) - pd.Timedelta(minutes=1)
+    if last_minute is not None and df["ts"].max() < last_minute:
+        got, need = (t.tz_convert("America/New_York").strftime("%Y-%m-%d %H:%M") for t in (df["ts"].max(), last_minute))
         raise RuntimeError(
-            f"Massive data for {ticker} stops on {last_day}, but sessions through "
-            f"{pd.Timestamp(expect_through).date()} were requested. Not caching a possibly "
-            "truncated download; retry, or choose an earlier --end if no data exists there."
+            f"Massive data for {ticker} ends at {got} ET, before the final session's last regular "
+            f"minute ({need} ET). Not caching a possibly truncated download; retry, or choose an "
+            f"earlier --end if {ticker} really did not trade at that close."
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path, index=False)

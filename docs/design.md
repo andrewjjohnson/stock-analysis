@@ -30,10 +30,12 @@ session date:
 - It holds `warmup_sessions` sessions before the first study session.
 - `run.main` drops today's session and later ones before downloading.
 
-**`download.load_minute_bars(ticker, start, end, *, cache_dir, refresh, adjusted, expect_through, client)`**
+**`download.load_minute_bars(ticker, start, end, *, cache_dir, refresh, adjusted, final_close, client)`**
 returns `(minutes, source)`.
 - `minutes` holds the raw provider rows `ts, open, high, low, close, volume, vwap,
   transactions`, including extended hours.
+- `final_close` is the UTC close of the last requested session. A fresh download must
+  reach that session's last regular minute, or it raises and is not cached.
 - The cache file is `<cache_dir>/<TICKER>_1min_<start>_<end>_<splitadj|unadjusted>.parquet`.
 - `client` exists so tests can pass a stand-in; production code leaves it `None`.
 
@@ -108,8 +110,11 @@ result, and coverage counts.
   rules ever change.
 - **Only the selected config touches the later segment.** Other configs' later results are
   never computed or seen, which keeps the later period as clean as it can be.
-- **Truncation guard.** The SDK's paginator returns silently if a page fails to decode.
-  Caching that short result would quietly shorten every later run.
+- **Truncation guard.** The SDK's paginator returns silently if a page fails to decode,
+  and pages arrive in time order. So a download counts as complete only if it reaches the
+  final session's last regular minute. The date alone isn't enough: the cut can land
+  mid-session, and pre-market bars already carry the final date. Caching a short result
+  would quietly shorten every later run.
 - **Today's session is never studied or cached.** It may still be open, or a delayed feed
   may still be filling in.
 - **Cache key = ticker, first and last session (warm-up included) and adjustment.**
@@ -132,6 +137,8 @@ result, and coverage counts.
   - outcomes computed for every bar
   - ignoring the cache
   - removing the truncation guard
+  - checking only the final session's date rather than its last regular minute (added
+    2026-09-29 after a review finding)
   - picking a winner when none qualifies
   - triggering on every bar above instead of on the cross
   - resetting intraday EMAs each session
