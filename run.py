@@ -6,6 +6,7 @@ mask -> rows and forward outcomes for triggered bars only -> summary, files, cha
   uv run python run.py --start 2025-04-01 --end 2026-03-31
   uv run python run.py --start 2025-04-01 --end 2026-03-31 --fast 5 9 12 --slow 20 21 30
   uv run python run.py --start 2025-04-01 --end 2026-03-31 --fast 5 9 12 --slow 20 21 30 --split-date 2025-10-01
+  uv run python run.py --strategy opening_range_reversal --start 2024-01-01 --end 2024-12-31 --barriers
 """
 
 import argparse
@@ -19,11 +20,13 @@ import download
 import features
 import outcomes
 import report
+import strategies.opening_range_reversal as orr
 from strategies.spy_ema import DAILY_EMA_PERIOD, spy_ema
 
+ORR = "opening_range_reversal"
 # CLI name -> plain strategy function. To add a strategy, write a function with the
 # same shape (features, **params) -> (mask, keep) and list it here.
-STRATEGIES = {"spy_ema": spy_ema}
+STRATEGIES = {"spy_ema": spy_ema, ORR: orr.opening_range_reversal}
 
 
 @contextmanager
@@ -81,28 +84,39 @@ def build_candidate_rows(bars, idx, strategy, config, segment):
     return rows
 
 
-def empty_candidates(config):
+def empty_candidates(config, barriers=False):
     """A zero-trigger result: the expected columns and no rows."""
     utc = "datetime64[ns, UTC]"
     dtypes = {"strategy": "str", "config": "str", **{k: np.asarray(v).dtype for k, v in config["params"].items()},
-              "segment": "str", "session": "datetime64[ns]", "bar_start": utc, "signal_time": utc,
-              "ref_close": float, **{k: float for k in config["keep"]}, **{k: float for k in outcomes.OUTCOME_COLUMNS}}
-    return pd.DataFrame({k: pd.Series(dtype=d) for k, d in dtypes.items()})
+              "segment": "str", "session": "datetime64[ns]", "bar_start": utc, "signal_time": utc, "ref_close": float}
+    columns = {k: pd.Series(dtype=d) for k, d in dtypes.items()}
+    columns |= {k: pd.Series(v[:0]) for k, v in config["keep"].items()}
+    columns |= {k: pd.Series(dtype=float) for k in outcomes.OUTCOME_COLUMNS}
+    if barriers:
+        columns |= {k: pd.Series(dtype=d) for k, d in outcomes.BARRIER_COLUMNS.items()}
+    return pd.DataFrame(columns)
 
 
-def evaluate_segment(segment, configs, bars, rth, strategy, timings):
+def evaluate_segment(segment, configs, bars, rth, strategy, timings, opening=None, barriers=False):
     """Candidate rows + outcomes for each config within one segment, and their summaries.
 
     Outcomes are computed once for the union of triggered bars across configs, then
-    shared: they depend only on the trigger bar, never on the configuration.
+    shared: they depend only on the trigger bar (and, for the opening-range reversal,
+    its session's side and levels), never on the configuration. `opening` (per-session
+    table) switches the summary to one row per side and pattern with session counts.
     """
     tables, summaries = [], []
     with timed(timings, "outcomes"):
         union = np.unique(np.concatenate([c["idx"][segment["name"]] for c in configs]))
         if union.size:
-            shared = outcomes.forward_outcomes(
-                rth, bars["bar_end"].iloc[union], bars["close"].iloc[union],
-                bars["session_close"].iloc[union], segment["end"])
+            at = bars.iloc[union]
+            side = at["side_sign"].to_numpy() if "side_sign" in bars else None
+            shared = outcomes.forward_outcomes(rth, at["bar_end"], at["close"], at["session_close"], segment["end"], side)
+            if barriers:
+                stop, target = orr.barrier_levels(bars, union)
+                exits = outcomes.barrier_exits(rth, at["bar_end"], side, stop, target, at["session_close"],
+                                               segment["end"])
+                shared = pd.concat([shared, exits], axis=1)
             shared.index = union
         for c in configs:
             idx = c["idx"][segment["name"]]
@@ -110,13 +124,18 @@ def evaluate_segment(segment, configs, bars, rth, strategy, timings):
                 rows = build_candidate_rows(bars, idx, strategy, c, segment)
                 table = pd.concat([rows, shared.loc[idx].reset_index(drop=True)], axis=1)
             else:
-                table = empty_candidates(c)
+                table = empty_candidates(c, barriers)
             tables.append(table)
     with timed(timings, "reporting"):
         for c, table in zip(configs, tables):
-            summaries.append({"strategy": strategy, "config": c["label"], **c["params"], "segment": segment["name"],
-                              "role": segment["role"], "first_session": segment["first"].date(),
-                              "last_session": segment["last"].date(), **report.summarize(table)})
+            base = {"strategy": strategy, "config": c["label"], **c["params"], "segment": segment["name"],
+                    "role": segment["role"], "first_session": segment["first"].date(),
+                    "last_session": segment["last"].date()}
+            if opening is None:
+                summaries.append({**base, **report.summarize(table)})
+            else:
+                counts = orr.opening_counts(opening.loc[segment["first"]:segment["last"]], c["params"]["threshold"])
+                summaries += [{**base, **row} for row in report.summarize_sides(table, counts, orr.PATTERNS, barriers)]
     return tables, summaries
 
 
@@ -127,17 +146,29 @@ def select_config(summaries, horizon, min_labeled):
 
 
 def run_study(minutes, sessions, *, strategy="spy_ema", fasts=(9,), slows=(21,), daily_filter=True,
-              bar_minutes=5, min_coverage=0.8, split_date=None, min_labeled=30, select_horizon=30, timings=None):
-    """Features -> triggers -> candidate outcomes -> summaries. No file I/O."""
-    timings = {} if timings is None else timings
-    configs, rejected = make_configs(fasts, slows, daily_filter)
-    if not configs:
-        raise SystemExit(f"No valid configurations: every pair has fast >= slow ({', '.join(rejected)}).")
+              thresholds=(orr.BASELINE_THRESHOLD,), barriers=False, bar_minutes=5, min_coverage=0.8,
+              split_date=None, min_labeled=30, select_horizon=30, timings=None):
+    """Features -> triggers -> candidate outcomes -> summaries. No file I/O.
 
+    spy_ema uses fasts/slows/daily_filter; opening_range_reversal uses thresholds and
+    barriers, with 5-minute bars and one summary row per side and pattern.
+    """
+    timings = {} if timings is None else timings
+    is_orr = strategy == ORR
+    if is_orr:
+        configs, rejected = orr.make_configs(thresholds), []
+    else:
+        configs, rejected = make_configs(fasts, slows, daily_filter)
+        if not configs:
+            raise SystemExit(f"No valid configurations: every pair has fast >= slow ({', '.join(rejected)}).")
+
+    opening = None
     with timed(timings, "features"):
-        periods = sorted({c["params"]["fast"] for c in configs} | {c["params"]["slow"] for c in configs})
+        periods = [] if is_orr else sorted({c["params"]["fast"] for c in configs} | {c["params"]["slow"] for c in configs})
         rth, bars, daily, info = features.build_features(minutes, sessions, bar_minutes, periods,
-                                                         DAILY_EMA_PERIOD, min_coverage)
+                                                         DAILY_EMA_PERIOD, min_coverage, orr.ATR_PERIOD)
+        if is_orr:
+            bars, opening = orr.add_features(bars, rth, daily, sessions)
     segments = make_segments(sessions, split_date)
 
     with timed(timings, "triggers"):
@@ -146,9 +177,19 @@ def run_study(minutes, sessions, *, strategy="spy_ema", fasts=(9,), slows=(21,),
             mask, c["keep"] = STRATEGIES[strategy](bars, **c["params"])
             c["idx"] = {name: np.flatnonzero(mask & inside) for name, inside in in_segment.items()}
 
-    tables, summaries = evaluate_segment(segments[0], configs, bars, rth, strategy, timings)
+    tables, summaries = evaluate_segment(segments[0], configs, bars, rth, strategy, timings, opening, barriers)
     selected = None
-    if split_date is not None:
+    if split_date is not None and is_orr:
+        # Long and short stay separate: each side picks its own threshold from its own earlier rows.
+        selected = {side: select_config([r for r in summaries if r["side"] == side and r["pattern"] == "all"],
+                                        select_horizon, min_labeled) for side in orr.SIDES}
+        chosen = [c for c in configs if c["label"] in selected.values()]
+        if chosen:
+            later_tables, later_summaries = evaluate_segment(segments[1], chosen, bars, rth, strategy, timings,
+                                                             opening, barriers)
+            tables += [t[t["side"].map(selected).eq(t["config"])] for t in later_tables]
+            summaries += [r for r in later_summaries if selected[r["side"]] == r["config"]]
+    elif split_date is not None:
         selected = select_config(summaries, select_horizon, min_labeled)
         if selected is not None:
             chosen = [c for c in configs if c["label"] == selected]
@@ -157,14 +198,46 @@ def run_study(minutes, sessions, *, strategy="spy_ema", fasts=(9,), slows=(21,),
             summaries += later_summaries
 
     non_empty = [t for t in tables if len(t)]
-    candidates = pd.concat(non_empty, ignore_index=True) if non_empty else empty_candidates(configs[0])
+    candidates = pd.concat(non_empty, ignore_index=True) if non_empty else empty_candidates(configs[0], barriers)
     return {"candidates": candidates, "summary": pd.DataFrame(summaries), "selected": selected,
-            "configs": [c["label"] for c in configs], "rejected": rejected, "segments": segments, "info": info}
+            "configs": [c["label"] for c in configs], "rejected": rejected, "segments": segments, "info": info,
+            "bars": bars}
+
+
+ORR_DEFINITION = {
+    "adaptation": "deterministic research adaptation of https://www.youtube.com/watch?v=XFtayhPIdEs, not a replay; "
+                  "numeric definitions, completed-candle signal, first-signal limit and fixed exits are our assumptions",
+    "opening_range": f"first {orr.OPENING_MINUTES} regular-session minutes, all present; known at open+{orr.OPENING_MINUTES}",
+    "size_gate": f"opening high - low >= threshold x daily ATR({orr.ATR_PERIOD}) from completed regular-session "
+                 "daily bars through the previous session",
+    "direction": "opening close < open: long only; > open: short only; equal: skipped",
+    "signal_bars": f"complete {orr.BAR_MINUTES}-minute bars anchored to the open, starting at/after open+"
+                   f"{orr.OPENING_MINUTES} and completing strictly before open+{orr.WINDOW_MINUTES}",
+    "patterns": "TA-Lib (installed version): long CDLHAMMER > 0 or CDLENGULFING > 0; short CDLSHOOTINGSTAR < 0 or "
+                "CDLENGULFING < 0; previous bar complete, contiguous and same-session",
+    "outside": "long: low and close strictly below opening low; short: high and close strictly above opening high",
+    "signal_limit": "earliest qualifying bar per ticker/session/threshold",
+    "filters": "none beyond the above (no trend, volume, RSI or EMA filter)",
+    "outcomes": "gross directional signal response from the signal bar close (side x raw return); not strategy P&L",
+}
+ORR_BARRIERS = {
+    "entry": "open of the minute starting at signal completion (idealized bar-based fill)",
+    "stop": "signal low (long) / high (short); engulfing: extreme across both candles",
+    "target": "opening high (long) / opening low (short)",
+    "exit": "first touch in time order; later open beyond stop exits at that open; beyond target exits at target; "
+            "both in one minute = ambiguous, stop first; otherwise regular-session close; gaps in data = unresolved",
+    "friction_bps_per_side": list(outcomes.COST_BPS),
+    "friction_note": "illustrative sensitivity, not calibrated costs; excludes borrow costs",
+}
 
 
 def settings_for(args, sessions, source, results):
     study = sessions[sessions["in_study"]]
     info = results["info"]
+    is_orr = args.strategy == ORR
+    strategy = ({"thresholds": args.threshold, "baseline_threshold": orr.BASELINE_THRESHOLD,
+                 "definition": ORR_DEFINITION, "barriers": ORR_BARRIERS if args.barriers else None}
+                if is_orr else {"daily_ema_period": DAILY_EMA_PERIOD})
     return {
         "ticker": args.ticker.upper(),
         "strategy": args.strategy,
@@ -176,7 +249,7 @@ def settings_for(args, sessions, source, results):
         "bar_minutes": args.bar_minutes,
         "min_bar_coverage": args.min_coverage,
         "warmup_sessions": args.warmup_sessions,
-        "daily_ema_period": DAILY_EMA_PERIOD,
+        **strategy,
         "daily_features": "from the previous completed session, used for the whole current session",
         "configs": results["configs"],
         "rejected_configs_fast_ge_slow": results["rejected"],
@@ -185,13 +258,15 @@ def settings_for(args, sessions, source, results):
         "excursion_minutes": outcomes.EXCURSION_MINUTES,
         "split_date": args.split_date,
         "selection": None if args.split_date is None else {
-            "metric": f"mean_{args.select_horizon}m_pct on the earlier segment",
+            "metric": f"mean_{args.select_horizon}m_pct on the earlier segment"
+                      + (", chosen separately for long and short" if is_orr else ""),
             "min_labeled_candidates": args.min_labeled, "selected": results["selected"]},
         "interpretation": ("exploratory / in-sample: no split date" if args.split_date is None else
                            "select on earlier segment, evaluate the pick once on the later segment; a later "
                            "period inspected repeatedly is not a pristine holdout"),
         "coverage": {k: info[k] for k in ("rth_minutes_expected", "rth_minutes_present", "bars_usable",
-                                          "bars_dropped_low_coverage", "study_sessions_missing_daily")}
+                                          "bars_dropped_low_coverage", "study_sessions_missing_daily",
+                                          "study_sessions_missing_atr")}
                     | {"sessions_without_data_count": len(info["sessions_without_data"]),
                        "sessions_partial_count": len(info["sessions_partial"]),
                        "first_20_sessions_without_data": info["sessions_without_data"][:20],
@@ -200,7 +275,7 @@ def settings_for(args, sessions, source, results):
 
 
 def print_report(args, sessions, source, results, timings, out_dir):
-    info, summary, segs = results["info"], results["summary"], results["segments"]
+    info = results["info"]
     study = sessions[sessions["in_study"]]
     missing = info["rth_minutes_expected"] - info["rth_minutes_present"]
     ema_gaps = ", ".join(f"{k}: {v}" for k, v in info["study_bars_missing"].items())
@@ -216,13 +291,31 @@ def print_report(args, sessions, source, results, timings, out_dir):
     if info["sessions_without_data"]:
         print(f"          no data: {', '.join(info['sessions_without_data'][:8])}"
               f"{' ...' if len(info['sessions_without_data']) > 8 else ''}")
-    print(f"bars      {info['bars_usable']:,} usable (dropped {info['bars_dropped_low_coverage']} below "
-          f"{args.min_coverage:.0%} minute coverage); study bars missing {ema_gaps}")
-    print(f"daily     previous-session EMA{DAILY_EMA_PERIOD} unavailable for {info['study_sessions_missing_daily']} "
-          f"of {len(study)} study sessions" + (" (daily filter off)" if not args.daily_filter else ""))
-    if results["rejected"]:
-        print(f"rejected  fast >= slow: {', '.join(results['rejected'])}")
+    if args.strategy == ORR:
+        print(f"bars      {info['bars_usable']:,} usable (dropped {info['bars_dropped_low_coverage']} below "
+              f"{args.min_coverage:.0%} minute coverage); signal bars, their previous bar and the opening range "
+              "must be complete")
+        print(f"daily     prior-session ATR{orr.ATR_PERIOD} unavailable for {info['study_sessions_missing_atr']} "
+              f"of {len(study)} study sessions")
+        print_orr_report(args, results)
+    else:
+        print(f"bars      {info['bars_usable']:,} usable (dropped {info['bars_dropped_low_coverage']} below "
+              f"{args.min_coverage:.0%} minute coverage); study bars missing {ema_gaps}")
+        print(f"daily     previous-session EMA{DAILY_EMA_PERIOD} unavailable for {info['study_sessions_missing_daily']} "
+              f"of {len(study)} study sessions" + (" (daily filter off)" if not args.daily_filter else ""))
+        if results["rejected"]:
+            print(f"rejected  fast >= slow: {', '.join(results['rejected'])}")
+        print_ema_report(args, results)
+    print(f"\n{report.CAVEAT}")
+    print("timings   " + " · ".join(f"{k} {timings.get(k, 0):.2f}s"
+                                   for k in ("data", "features", "triggers", "outcomes", "reporting")))
+    charts = f", {len(results.get('candidate_charts', []))} candidate chart(s)" if args.strategy == ORR else ""
+    print(f"outputs   {out_dir}/: candidates.parquet ({len(results['candidates'])} rows), summary.csv, "
+          f"settings.json, chart.png{charts}")
 
+
+def print_ema_report(args, results):
+    summary, segs = results["summary"], results["segments"]
     first = summary[summary["segment"] == segs[0]["name"]]
     if args.split_date is None:
         print(f"\nExploratory / in-sample (no --split-date): {len(first)} configuration(s)")
@@ -239,33 +332,75 @@ def print_report(args, sessions, source, results, timings, out_dir):
                   f"{segs[1]['first'].date()} to {segs[1]['last'].date()}:")
             print(report.format_table(summary[summary["segment"] == "later"]))
             print("A later period you keep re-inspecting stops being a clean holdout.")
-    print(f"\n{report.CAVEAT}")
-    print("timings   " + " · ".join(f"{k} {timings.get(k, 0):.2f}s"
-                                   for k in ("data", "features", "triggers", "outcomes", "reporting")))
-    print(f"outputs   {out_dir}/: candidates.parquet ({len(results['candidates'])} rows), summary.csv, "
-          "settings.json, chart.png")
+
+
+def print_orr_report(args, results):
+    summary, segs, selected = results["summary"], results["segments"], results["selected"]
+    print("\nSession funnel (counts only; one signal at most per session and threshold)")
+    print(report.format_counts(summary))
+    first = summary[summary["segment"] == segs[0]["name"]]
+    if args.split_date is None:
+        print("\nExploratory / in-sample (no --split-date). Gross directional signal response from the signal bar "
+              "close, NOT strategy P&L; long and short kept separate")
+    else:
+        print(f"\nSelection on earlier segment {segs[0]['first'].date()} to {segs[0]['last'].date()}, separately "
+              f"per side: highest mean directional {args.select_horizon}m return with >= {args.min_labeled} "
+              f"available {args.select_horizon}m outcomes. Gross signal response, NOT strategy P&L")
+    print(report.format_table(first))
+    if args.barriers:
+        print(f"\nBarrier comparison ({segs[0]['name']}): {report.BARRIER_CAVEAT}")
+        print(report.format_barrier_table(first))
+    if args.split_date is not None:
+        later = summary[summary["segment"] == "later"]
+        for side, pick in selected.items():
+            print(f"{side}: " + (f"selected {pick}; evaluated once on {segs[1]['first'].date()} to "
+                                 f"{segs[1]['last'].date()}" if pick else "no threshold qualified; later "
+                                 "segment not evaluated for this side"))
+        if len(later):
+            print(report.format_table(later))
+            if args.barriers:
+                print(report.format_barrier_table(later))
+            print("A later period you keep re-inspecting stops being a clean holdout.")
+    print("Short-side rows do not establish borrow availability or executable short returns. SPY and QQQ are "
+          "correlated: separate runs are not independent evidence.")
 
 
 def execute(args, minutes, sessions, source, timings):
     """Run the study on already-loaded minutes, write outputs, print the summary."""
     results = run_study(minutes, sessions, strategy=args.strategy, fasts=args.fast, slows=args.slow,
-                        daily_filter=args.daily_filter, bar_minutes=args.bar_minutes, min_coverage=args.min_coverage,
-                        split_date=args.split_date, min_labeled=args.min_labeled,
-                        select_horizon=args.select_horizon, timings=timings)
+                        daily_filter=args.daily_filter, thresholds=args.threshold, barriers=args.barriers,
+                        bar_minutes=args.bar_minutes, min_coverage=args.min_coverage, split_date=args.split_date,
+                        min_labeled=args.min_labeled, select_horizon=args.select_horizon, timings=timings)
+    ticker = args.ticker.upper()
     with timed(timings, "reporting"):
+        results["candidates"].insert(0, "ticker", ticker)
+        results["summary"].insert(0, "ticker", ticker)
         # Chart one configuration when there is one to show; otherwise compare them all.
         configs, selected = results["configs"], results["selected"]
-        chart_config = selected or (configs[0] if len(configs) == 1 else None)
-        title = f"{args.ticker.upper()} · {args.strategy} · {chart_config or f'{len(configs)} configurations'}"
-        if selected:
+        if args.strategy == ORR:
+            chart_config = configs[0] if len(configs) == 1 and args.split_date is None else None
+            picked = bool(selected) and any(selected.values())
+        else:
+            chart_config = selected or (configs[0] if len(configs) == 1 else None)
+            picked = bool(selected)
+        title = f"{ticker} · {args.strategy} · {chart_config or f'{len(configs)} configurations'}"
+        if picked:
             context = "Selected on the earlier segment only, then evaluated once on the later segment."
         elif args.split_date:
             context = "Split date given but no configuration qualified: earlier (selection) segment only."
         else:
             context = "In-sample / exploratory: no split date."
+        if args.strategy == ORR:
+            context += " Gross directional signal response, not P&L; long and short separate."
         out = report.write_outputs(args.out, results["candidates"], results["summary"],
                                    settings_for(args, sessions, source, results), title, context,
                                    chart_config, args.select_horizon)
+        if args.strategy == ORR:
+            # First candidates in time for the baseline (else first) threshold; never picked by outcome.
+            shown = next((c for c in configs if c == orr.config_label(orr.BASELINE_THRESHOLD)), configs[0])
+            cands = results["candidates"]
+            results["candidate_charts"] = report.plot_candidates(out, cands[cands["config"] == shown],
+                                                                 results["bars"], ticker)
     print_report(args, sessions, source, results, timings, out)
     return results
 
@@ -286,6 +421,11 @@ def parse_args(argv=None):
     p.add_argument("--slow", type=int, nargs="+", default=[21], help="slow EMA period(s); several values = sweep")
     p.add_argument("--daily-filter", action=argparse.BooleanOptionalAction, default=True,
                    help="require previous session close > its daily EMA50 (default on)")
+    p.add_argument("--threshold", type=float, nargs="+", default=[orr.BASELINE_THRESHOLD],
+                   help="opening_range_reversal: opening range / prior ATR14 gate(s); baseline 0.25, "
+                        "small sweep 0.20 0.25 0.30")
+    p.add_argument("--barriers", action="store_true",
+                   help="opening_range_reversal: add the fixed stop/target comparison (idealized, not P&L)")
     p.add_argument("--split-date", type=iso_date, help="select on sessions before this date, evaluate the pick on sessions from it")
     p.add_argument("--min-labeled", type=int, default=30,
                    help="min candidates with an available selection-horizon outcome to qualify (default 30)")
@@ -302,6 +442,12 @@ def parse_args(argv=None):
         p.error("need --bar-minutes >= 1, --warmup-sessions >= 0 and 0 < --min-coverage <= 1")
     if min(args.fast + args.slow) < 2:
         p.error("EMA periods must be >= 2")
+    if args.strategy == ORR and args.bar_minutes != orr.BAR_MINUTES:
+        p.error(f"{ORR} uses {orr.BAR_MINUTES}-minute signal bars (--bar-minutes {orr.BAR_MINUTES})")
+    if args.strategy != ORR and args.barriers:
+        p.error(f"--barriers applies only to --strategy {ORR}")
+    if min(args.threshold) <= 0:
+        p.error("--threshold values must be > 0")
     return args
 
 
