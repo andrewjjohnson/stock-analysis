@@ -1,6 +1,7 @@
 """Offline demo on SYNTHETIC data: no API key, no network.
 
-Runs the same pipeline as run.py (single config, sweep, split) on a seeded random
+Runs the same pipeline as run.py (EMA single config, sweep and split; opening-range
+reversal baseline and threshold sweep with split, both with barriers) on a seeded random
 walk laid on the real XNYS calendar, labeled ticker SYNTHETIC. It checks the
 workflow end to end; its numbers say nothing about any real market.
 
@@ -17,6 +18,9 @@ RUNS = {
     "single": [],
     "sweep": ["--fast", "5", "9", "12", "--slow", "20", "21", "30"],
     "split": ["--fast", "5", "9", "12", "--slow", "20", "21", "30", "--split-date", SPLIT],
+    "orr": ["--strategy", "opening_range_reversal", "--barriers"],
+    "orr_split": ["--strategy", "opening_range_reversal", "--barriers", "--threshold", "0.20", "0.25", "0.30",
+                  "--split-date", SPLIT],
 }
 
 

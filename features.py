@@ -74,12 +74,13 @@ def resample_bars(rth, bar_minutes=5, min_coverage=0.8):
     return bars[usable].reset_index(drop=True), int((~usable).sum())
 
 
-def daily_features(rth, sessions, min_coverage=0.8, ema_period=50):
+def daily_features(rth, sessions, min_coverage=0.8, ema_period=50, atr_period=14):
     """Regular-session daily bars from the same minutes, plus prior-session features.
 
-    Row D holds session D's own bar and, in `prev_close` / `prev_ema_{p}`, the values
-    from the previous XNYS session: the daily information usable throughout session D.
-    Sessions below `min_coverage` are left out of the EMA and give NaN to the next day.
+    Row D holds session D's own bar and, in `prev_close` / `prev_ema_{p}` /
+    `prev_atr_{p}`, the values from the previous XNYS session: the daily information
+    usable throughout session D. Sessions below `min_coverage` are left out of the EMA
+    and ATR (whose true range then uses the last usable close) and give NaN to the next day.
     """
     d = (
         rth.groupby("session")
@@ -94,12 +95,18 @@ def daily_features(rth, sessions, min_coverage=0.8, ema_period=50):
     usable = d["usable"].to_numpy()
     ema[usable] = talib.EMA(d["close"].to_numpy(float)[usable], timeperiod=ema_period)
     d[f"ema_{ema_period}"] = ema
+    atr = np.full(len(d), np.nan)
+    high, low, close = (d[k].to_numpy(float)[usable] for k in ("high", "low", "close"))
+    atr[usable] = talib.ATR(high, low, close, timeperiod=atr_period)
+    d[f"atr_{atr_period}"] = atr
     d["prev_close"] = d["close"].where(d["usable"]).shift(1)
     d[f"prev_ema_{ema_period}"] = d[f"ema_{ema_period}"].shift(1)
+    d[f"prev_atr_{atr_period}"] = d[f"atr_{atr_period}"].shift(1)
     return d
 
 
-def build_features(minutes, sessions, bar_minutes=5, ema_periods=(9, 21), daily_ema_period=50, min_coverage=0.8):
+def build_features(minutes, sessions, bar_minutes=5, ema_periods=(9, 21), daily_ema_period=50, min_coverage=0.8,
+                   atr_period=14):
     """Everything a strategy may look at, computed over warm-up + study history.
 
     Returns (rth_minutes, bars, daily, info). `bars` holds usable bars only, with one
@@ -112,8 +119,8 @@ def build_features(minutes, sessions, bar_minutes=5, ema_periods=(9, 21), daily_
     close = bars["close"].to_numpy(float)
     for p in sorted(set(ema_periods)):
         bars[f"ema_{p}"] = talib.EMA(close, timeperiod=p)
-    daily = daily_features(rth, sessions, min_coverage, daily_ema_period)
-    bars = bars.join(daily[["prev_close", f"prev_ema_{daily_ema_period}"]], on="session")
+    daily = daily_features(rth, sessions, min_coverage, daily_ema_period, atr_period)
+    bars = bars.join(daily[["prev_close", f"prev_ema_{daily_ema_period}", f"prev_atr_{atr_period}"]], on="session")
     bars = bars.join(sessions["in_study"], on="session")
 
     in_study = sessions["in_study"]
@@ -131,5 +138,6 @@ def build_features(minutes, sessions, bar_minutes=5, ema_periods=(9, 21), daily_
         study_bars=len(study_bars),
         study_bars_missing={f"ema_{p}": int(study_bars[f"ema_{p}"].isna().sum()) for p in sorted(set(ema_periods))},
         study_sessions_missing_daily=int(daily.loc[in_study, f"prev_ema_{daily_ema_period}"].isna().sum()),
+        study_sessions_missing_atr=int(daily.loc[in_study, f"prev_atr_{atr_period}"].isna().sum()),
     )
     return rth, bars, daily, info
