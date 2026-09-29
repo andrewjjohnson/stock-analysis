@@ -356,3 +356,19 @@ def test_threshold_labels_are_unique_because_selection_uses_them():
     later = result["candidates"][result["candidates"]["segment"] == "later"]
     assert len(later) and not later.duplicated(["session", "side"]).any()  # only the picked threshold per side
     assert set(zip(later["side"], later["config"])) <= set(result["selected"].items())
+
+
+def test_reused_output_directory_drops_earlier_candidate_charts(tmp_path):
+    sessions = three_sessions()
+    minutes = build(sessions, {"2024-03-08": HAMMER_DAY, "2024-03-11": ENGULF_DAY, "2024-03-12": STAR_DAY})
+    common = ["--start", "2024-03-08", "--end", "2024-03-12", "--warmup-sessions", "20", "--out", str(tmp_path)]
+    run.execute(run.parse_args(["--strategy", ORR, *common]), minutes, sessions, "SYNTHETIC test fixture", {})
+    assert len(list(tmp_path.glob("candidate_*.png"))) == 3
+
+    one_day = {"2024-03-11": ENGULF_DAY}  # fewer candidates on a different date
+    run.execute(run.parse_args(["--strategy", ORR, *common]), build(sessions, one_day), sessions, "SYNTHETIC", {})
+    assert [p.name for p in tmp_path.glob("candidate_*.png")] == ["candidate_1_2024-03-11_short.png"]
+
+    run.execute(run.parse_args(common), minutes, sessions, "SYNTHETIC test fixture", {})  # EMA run: no charts
+    assert not list(tmp_path.glob("candidate_*.png"))
+    assert (tmp_path / "summary.csv").exists()

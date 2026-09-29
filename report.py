@@ -165,6 +165,8 @@ def format_barrier_table(summary):
 def write_outputs(out_dir, candidates, summary, settings, title, context, chart_config=None, horizon=30):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    for stale in out.glob("candidate_*.png"):  # a reused directory must not show an earlier run's charts
+        stale.unlink()
     candidates.to_parquet(out / "candidates.parquet", index=False)
     summary.to_csv(out / "summary.csv", index=False)
     (out / "settings.json").write_text(json.dumps(settings, indent=2, default=str) + "\n")
