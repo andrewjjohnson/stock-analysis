@@ -39,7 +39,9 @@ OPENING_COLUMNS = ["or_open", "or_high", "or_low", "or_close"]
 
 
 def config_label(threshold):
-    return f"threshold={threshold:.2f}" + (" (baseline)" if threshold == BASELINE_THRESHOLD else "")
+    """Unique per threshold: two decimals only when they are exact, since labels key selection."""
+    text = f"{threshold:.2f}" if float(f"{threshold:.2f}") == threshold else repr(threshold)
+    return f"threshold={text}" + (" (baseline)" if threshold == BASELINE_THRESHOLD else "")
 
 
 def make_configs(thresholds):

@@ -148,7 +148,7 @@ def test_threshold_boundary_uses_greater_or_equal():
     minutes = build(sessions, {"2024-03-08": HAMMER_DAY})
     # Opening range 0.625 vs prior ATR 2.0: 0.3125 x 2.0 is exactly 0.625; one 1/64 step higher fails.
     result = study(minutes, sessions, thresholds=[0.3125, 0.328125])
-    assert result["candidates"]["config"].tolist() == ["threshold=0.31"]
+    assert result["candidates"]["config"].tolist() == ["threshold=0.3125"]
     summary = result["summary"].set_index(["threshold", "side", "pattern"])
     assert summary.loc[(0.3125, "long", "all"), "qualifying_openings"] == 1
     assert summary.loc[(0.328125, "long", "all"), "qualifying_openings"] == 0
@@ -344,3 +344,15 @@ def test_split_selects_each_side_on_earlier_rows_only(tmp_path):
     early = cands[cands["segment"] == "earlier"]
     assert (early["exit_time"].dropna() <= last_early_close).all()  # earlier labels never reach past the split
     assert (early["signal_time"] + pd.Timedelta(minutes=120))[early["fwd_ret_120m_pct"].notna()].le(last_early_close).all()
+
+
+def test_threshold_labels_are_unique_because_selection_uses_them():
+    labels = [c["label"] for c in orr.make_configs([0.20, 0.25, 0.251, 0.252, 0.2500001, 0.25])]
+    assert labels == ["threshold=0.20", "threshold=0.25 (baseline)", "threshold=0.251", "threshold=0.252",
+                      "threshold=0.2500001"]  # duplicates dropped, near-equal values stay distinct
+    sessions = features.trading_sessions("2024-01-02", "2024-12-31", warmup_sessions=120)
+    result = study(synthetic.random_walk_minutes(sessions, seed=7), sessions, thresholds=[0.21, 0.214],
+                   split_date="2024-07-01", min_labeled=5)
+    later = result["candidates"][result["candidates"]["segment"] == "later"]
+    assert len(later) and not later.duplicated(["session", "side"]).any()  # only the picked threshold per side
+    assert set(zip(later["side"], later["config"])) <= set(result["selected"].items())
