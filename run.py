@@ -465,7 +465,7 @@ def main(argv=None):
             raise SystemExit("No completed sessions in the requested study range.")
         first, last = sessions.index[0].date(), sessions.index[-1].date()
         minutes, source = download.load_minute_bars(args.ticker, str(first), str(last), cache_dir=args.cache_dir,
-                                                    refresh=args.refresh, expect_through=last)
+                                                    refresh=args.refresh, final_close=sessions["close"].iloc[-1])
     execute(args, minutes, sessions, source, timings)
 
 

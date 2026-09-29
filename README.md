@@ -57,8 +57,9 @@ see `uv run python run.py --help`. The first run downloads the study range plus 
 warm-up sessions to `data/cache/<TICKER>_1min_<first>_<last>_splitadj.parquet`, and
 repeating the same request reads that file without network access. That is why the
 three commands above share one date range: the sweep and split reuse the first download.
-On a rate-limited plan, a long first download can take a minute or two. If Massive
-returns less data than the calendar expects, the run stops and nothing is cached.
+On a rate-limited plan, a long first download can take a minute or two. If a download
+stops before the last regular-session minute of the final requested day, the run stops
+and nothing is cached. Gaps elsewhere are reported in the coverage lines, never filled.
 
 Offline demo on clearly labeled SYNTHETIC random-walk data (no key, no network); it runs
 the EMA single, sweep and split runs and two opening-range reversal runs into `output/demo/`:

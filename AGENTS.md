@@ -95,7 +95,7 @@ Data flow, one ticker per run:
 | **No lookahead:** Massive timestamps are bar starts, and a bar's close/high/low are usable only at `bar_end`. Daily features come from the previous session. Intraday EMAs are causal and run continuously across sessions, with no morning reset. | `test_future_prices_cannot_change_earlier_features_or_triggers` |
 | **Outcomes:** looked up by elapsed minutes from T = `bar_end`. A value exists only if every minute in [T, T+h) is present and T+h is no later than the session close and the segment end. Otherwise it is NaN and the candidate is kept. MFE ≥ 0 ≥ MAE, and the trigger bar's own minutes are excluded. | `test_missing_minutes_close_and_segment_end_give_nan_but_keep_rows`, `test_known_trigger_timestamp_and_outcomes_only_for_triggers` |
 | **Split:** rank only on earlier-segment summaries; a config qualifies with ≥ `--min-labeled` available outcomes at `--select-horizon`. Only the pick is evaluated later, nothing is picked if none qualifies, and without a split everything is labeled exploratory/in-sample. | `test_split_selects_on_earlier_segment_and_outcomes_stay_inside_segments` |
-| **Data:** an identical request reads the cache without creating a Massive client. Every page is fetched. A download that ends before the last expected session raises an error and is not cached. Synthetic data is never a fallback for a failed request. | `tests/test_download.py` |
+| **Data:** an identical request reads the cache without creating a Massive client. Every page is fetched. A fresh download that doesn't reach the final session's last regular-hours minute raises an error and is not cached; checking only the date would accept a download cut off mid-session or holding only pre-market bars. Synthetic data is never a fallback for a failed request. | `tests/test_download.py` |
 
 Missing minutes are never filled. Gaps are dropped and reported (in the coverage lines and
 `settings.json`), and rows whose required inputs are NaN never trigger.
@@ -149,6 +149,7 @@ Missing minutes are never filled. Gaps are dropped and reported (in the coverage
 - **Commit identity:** git has no global identity on the user's machine. Commit with
   `git -c user.name=… -c user.email=…`, using the identity from
   `git log -1 --format='%an <%ae>'`.
-- **Live data unverified:** as of 2026-09-28, no live Massive request has been made from
-  this repo, because no key was available. After the first real run, check its coverage
-  lines and `settings.json`, then update this line.
+- **Live data:** real Massive downloads have worked since 2026-09-29 (SPY, QQQ and NVDA
+  runs). Minute history on the current plan appears to start around 2021-09-30: NVDA
+  requested from 2020 comes back starting then, and the missing earlier sessions are
+  reported as sessions without data.
