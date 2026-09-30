@@ -88,12 +88,14 @@ BARRIER_COLUMNS = {
 }
 
 
-def barrier_exits(minutes, entry_time, side, stop, target, session_close, segment_end, cost_bps=COST_BPS):
+def barrier_exits(minutes, entry_time, side, stop, target, session_close, segment_end, cost_bps=COST_BPS,
+                  min_reward_risk=None):
     """Idealized fixed stop/target path for each already-triggered candidate, in the order given.
 
     - Entry: the open of the minute bar starting at entry_time, which must exist.
       entry_status is "unavailable" otherwise, and "invalid" unless stop < entry <
-      target (long) or target < entry < stop (short); the candidate is kept either way.
+      target (long) or target < entry < stop (short) and, when min_reward_risk is given,
+      |target - entry| / |entry - stop| >= min_reward_risk. The candidate is kept either way.
     - Minutes are inspected in time order from the entry minute. A later minute that
       opens beyond the stop exits at that open ("stop_gap"); one that opens beyond the
       target exits at the target, conservatively. Otherwise a touch (low <= stop,
@@ -123,7 +125,8 @@ def barrier_exits(minutes, entry_time, side, stop, target, session_close, segmen
             status[i] = "unavailable"
             continue
         entry[i] = op[j]
-        if not (s[i] * (target[i] - entry[i]) > 0 and s[i] * (entry[i] - stop[i]) > 0):
+        reward, risk = s[i] * (target[i] - entry[i]), s[i] * (entry[i] - stop[i])
+        if not (reward > 0 and risk > 0) or (min_reward_risk is not None and reward / risk < min_reward_risk):
             status[i] = "invalid"
             continue
         status[i] = "ok"

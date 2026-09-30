@@ -2,8 +2,9 @@
 
 A personal proof of concept for quickly testing an intraday stock signal on Massive
 one-minute bars and comparing what happened afterwards. It is a **signal study**, not a
-backtest: no orders, fills, costs, position sizing or P&L (the opening-range reversal's
-optional `--barriers` comparison is the one narrow, clearly labeled exception). It is
+backtest: no orders, fills, costs, position sizing or P&L (the optional `--barriers`
+comparison of the opening-range reversal and auction reclaim is the one narrow, clearly
+labeled exception). It is
 independent of Quant Forge and shares no code or data with it.
 
 ## Setup
@@ -61,7 +62,8 @@ On a rate-limited plan, a long first download can take a minute or two. If Massi
 returns less data than the calendar expects, the run stops and nothing is cached.
 
 Offline demo on clearly labeled SYNTHETIC random-walk data (no key, no network); it runs
-the EMA single, sweep and split runs and two opening-range reversal runs into `output/demo/`:
+the EMA single, sweep and split runs, two opening-range reversal runs and the auction
+reclaim comparison into `output/demo/`:
 
 ```bash
 uv run python demo.py
@@ -134,6 +136,121 @@ discretionary exits; each ETF's own prices and ATR (no index points, futures or 
 mapping). Its performance claims and its explanation of institutional intent are not
 assumed.
 
+## Auction reclaim (`--strategy auction_reclaim`)
+
+Our own deterministic approximation of the failed-auction **reversion** model in Fabio
+Valentini's published Auction Market playbook
+([Chart Fanatics](https://www.chartfanatics.com/strategies/auction-market-strategy)):
+prior-session value, a failed auction outside it, a reclaim, a pullback, confirmation and
+a return toward the prior point of control. It is not his method and claims nothing about
+his performance. Every number below is a research default, not a verified rule of his.
+There is no continuation strategy.
+
+What minute OHLCV cannot see: **order flow**. Relative volume is total-volume intensity,
+and the candle rule is a shape. Neither measures aggressive buyers or sellers, absorption
+or cumulative delta. The profile is a `bar_approximated_volume_profile`: each minute's
+volume is spread evenly over its [low, high], which is **not traded volume at price**.
+
+Default ticker QQQ; run SPY separately (equity/ETF minute data only, no futures or order
+book). No dates are designated exploratory and none are documented as a reserved holdout,
+so calendar 2024 is the explicitly exploratory period, with the split at 2024-07-01 that
+the opening-range reversal already uses:
+
+```bash
+uv run python run.py --strategy auction_reclaim --ticker QQQ --start 2024-01-01 --end 2024-12-31 --barriers --out output/ar_qqq
+uv run python run.py --strategy auction_reclaim --ticker SPY --start 2024-01-01 --end 2024-12-31 --barriers --out output/ar_spy
+```
+
+Diagnostic comparisons (`--compare`): the baseline plus four variants that each change one
+setting (`reclaim_lvn` location, relative-volume filter off, 32 bins, 64 bins), all run on
+one shared set of features. With `--split-date`, the variants are compared on the earlier
+segment only. Nothing is selected: the baseline, fixed in advance, is the only
+configuration evaluated on the later segment.
+
+```bash
+uv run python run.py --strategy auction_reclaim --ticker QQQ --start 2024-01-01 --end 2024-12-31 --compare --split-date 2024-07-01 --barriers --out output/ar_qqq_compare
+uv run python run.py --strategy auction_reclaim --ticker SPY --start 2024-01-01 --end 2024-12-31 --compare --split-date 2024-07-01 --barriers --out output/ar_spy_compare
+```
+
+Single settings: `--rules baseline|loose`, `--location value_edge|reclaim_lvn`,
+`--profile-bins N`, `--no-rvol-filter`. `--compare` applies its four one-change variants to
+the chosen rule set.
+
+**Rule sets.** `baseline` is defined below. `loose` changes only five settings: signal bars
+may complete until 15:30 ET, the retest window is 6 bars, the candle needs a body >= 30% of
+its range with the close in the top (long) or bottom (short) 40%, and reward/risk >= 1.0
+(also at the actual entry for `--barriers`). It was fixed after seeing only 2024 signal
+counts under candidate relaxations, never any outcomes.
+
+**Periods for auction_reclaim.** Massive gives about five years of minute history (from
+2021-09-30 when this was set up), so with 120 warm-up sessions the first study date is
+2022-04-01.
+
+- **Exploration**: 2022-04-01 to 2024-12-31 on QQQ, SPY, IWM and DIA.
+- **Held back**: 2025-01-01 onward. Run it once, and only with a configuration chosen
+  before looking at it; after that it is no longer a clean check.
+
+```bash
+uv run --env-file .env python run.py --strategy auction_reclaim --ticker IWM --start 2022-04-01 --end 2024-12-31 --rules loose --compare --barriers --out output/ar_explore/iwm_loose
+```
+
+DIA has missing minutes on many sessions (348 of 811 in 2021-10..2024-12). The rule that
+the previous session must be complete then removes almost half of its profiles, and an
+incomplete 5-minute bar resets a setup.
+
+Definitions (in `strategies/auction_reclaim.py` and `volume_profile.py`), per ticker and
+session. The long side is shown; the short side mirrors it:
+
+- **Frozen at the open**:
+  - **Profile**: from the immediately preceding XNYS session, which must have every expected
+    regular-session minute and valid OHLCV. It uses 48 equal bins from that session's low to
+    its high, with the last bin including its right edge. POC is the center of the largest
+    bin (ties: lower). The value area starts at POC and adds the larger adjacent bin (ties:
+    lower first) until it holds 70% of the volume; VAL and VAH are its edges. An unusable
+    previous session skips the day. An older session is never substituted.
+  - **ATR and offsets**: A = TA-Lib ATR(14) of completed daily bars through the previous
+    session, with b = 0.02 A and d = 0.03 A.
+- **VWAP**: reset at each open. It is the cumulative Massive minute `vwap` x volume while
+  every positive-volume minute so far has that field. After that, HLC3 x volume over the
+  whole prefix, labeled `hlc3_approximation`. It is read at the signal bar's completion and
+  exactly 15 minutes earlier, both with the method valid at the signal, so a later switch
+  never revises an earlier signal.
+- **Relative volume**: 5-minute volume / median of the same session-relative slot over the
+  20 preceding sessions (today excluded, at least 10 complete observations).
+- **Sequence** (complete 5-minute bars; a missing or incomplete bar resets):
+  1. **Balance**: at least 3 of the 4 bars before the excursion close in [VAL, VAH].
+  2. **Excursion**: a close < VAL - b after a close that was not (a fresh break).
+  3. **Reclaim**: the first bar within the next 6 with a close in (VAL + b, POC) and
+     close > open. A high at POC first expires the setup. The reclaim never signals.
+  4. **Retest**: the first bar within the next 3 that overlaps [VAL - d, VAL + d] and closes
+     in (VAL + b, POC).
+  5. **Invalidation**: checked first on every bar after the reclaim, including the trigger:
+     a low below the excursion low (tracked through the reclaim bar), a high at POC, or a
+     close < VAL - b.
+- **Confirmation**:
+  - **Candle**: close > open, body >= 50% of the range, close in the top 25% of the range.
+  - **Relative volume**: >= 1.20.
+  - **VWAP**: close < VWAP, and VWAP minus VWAP 15 minutes earlier >= -0.10 A.
+  - **Reward/risk**: stop = excursion low - 0.01 A and target = previous POC, with
+    reward/risk >= 1.25 at the signal close.
+- **Limits**: signal bars complete 09:50-11:30 ET inclusive (`loose`: until 15:30). Each
+  session allows one candidate per side, regardless of outcome, and one active setup at a time.
+- **`reclaim_lvn`**: at the reclaim only, it builds a 16-bin approximate profile of the
+  minutes from the excursion-extreme bar through the reclaim, which needs at least 10
+  minutes. Volume is smoothed with [1,2,1]/4, and the first and last two bins are never
+  candidates. A node has positive volume, smoothed volume below both neighbors, and
+  smoothed volume at most half of the smaller of the peaks on each side. Its center must be
+  inside prior value and below the reclaim close. The node nearest VAL wins (ties: lower),
+  and its bin replaces the edge band; the retest must close above it. With no node there is
+  no setup, the edge is never substituted, and the count is reported as `no LVN`.
+
+`--barriers` reuses the idealized fixed-exit comparison. Entry is the open of the minute
+starting at signal completion, never the retest extreme. Stop and target stay frozen, and
+the exit is the stop, the target or the session close, with the same gap, ambiguity and
+missing-data rules. `entry_status` is `invalid` when the actual entry breaks the geometry
+or gives reward/risk < 1.25; the candidate is kept and nothing replaces it. Long and short
+stay separate. Short borrow feasibility and costs are not modeled.
+
 ## Output (in `--out`)
 
 - `candidates.parquet`: one row per trigger, with configuration, segment, `signal_time`
@@ -166,6 +283,27 @@ Every run also adds a `ticker` column to both tables. For `opening_range_reversa
   picked by outcome), with 5-minute candles, the opening box, the signal bar, entry/stop/
   target and a small feature/level table for checking alignment.
 
+For `auction_reclaim`:
+
+- `candidates.parquet` adds the variant (`location`, `profile_bins`, `rvol_filter`),
+  `side`, `profile_method`, `prev_session`, `val`/`poc`/`vah`, `prev_atr_14`, `buffer_b`,
+  `retest_tol_d`, session-relative 5-minute slots and end times for the excursion, extreme,
+  reclaim and signal, `excursion_extreme`, `reclaim_close`, the retest location
+  (`location_lo`/`location_hi`: the edge band or the frozen LVN bin), candle fractions,
+  `rvol`/`rvol_base`, `vwap`, `vwap_15m_ago`, `vwap_change_15m`, `vwap_method`,
+  `frozen_stop`, `frozen_target`, `signal_reward_risk` and, with `--barriers`, the barrier
+  columns listed above.
+- `summary.csv` has one row per variant, segment and side, with the aggregate setup funnel.
+  It covers sessions, eligible sessions, missing profile or ATR, excursions, reclaims
+  (including POC-first and expired), `lvn_no_node`, invalidations by reason, expired
+  retests, and resets for missing bars and for the 11:30 cutoff. No per-bar records are
+  kept.
+- `stability.csv`: candidates and mean 30-minute directional return (and barrier R) per
+  variant, segment, side and year, then month.
+- `candidate_<n>_<session>_<side>.png`: the first six candidates of the baseline (or single)
+  configuration by time. Each shows the previous-session profile, candles, VAL/POC/VAH,
+  VWAP, the excursion, reclaim and signal bars, the retest location and the stop/target.
+
 ## Editing or adding a strategy
 
 `spy_ema()` in `strategies/spy_ema.py` is a plain function. It receives the feature
@@ -179,6 +317,10 @@ table holds only completed, adequately covered bars and no outcomes. Its columns
    and give it a parameter grid in `make_configs`.
 3. For a new indicator, add a TA-Lib column in `features.build_features`; it is computed
    once and reused by every configuration.
+
+`auction_reclaim` is the exception: it needs a small per-session state machine rather than
+a vectorized mask. It returns `(mask, triggers, funnel)`: the snapshot rows are built only
+when a signal fires, and the funnel holds aggregate counts.
 
 ## Assumptions that affect interpretation
 

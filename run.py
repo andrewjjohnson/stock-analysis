@@ -7,6 +7,7 @@ mask -> rows and forward outcomes for triggered bars only -> summary, files, cha
   uv run python run.py --start 2025-04-01 --end 2026-03-31 --fast 5 9 12 --slow 20 21 30
   uv run python run.py --start 2025-04-01 --end 2026-03-31 --fast 5 9 12 --slow 20 21 30 --split-date 2025-10-01
   uv run python run.py --strategy opening_range_reversal --start 2024-01-01 --end 2024-12-31 --barriers
+  uv run python run.py --strategy auction_reclaim --start 2024-01-01 --end 2024-12-31 --barriers
 """
 
 import argparse
@@ -20,13 +21,17 @@ import download
 import features
 import outcomes
 import report
+import strategies.auction_reclaim as ar
 import strategies.opening_range_reversal as orr
+import volume_profile
 from strategies.spy_ema import DAILY_EMA_PERIOD, spy_ema
 
 ORR = "opening_range_reversal"
+AR = "auction_reclaim"
 # CLI name -> plain strategy function. To add a strategy, write a function with the
-# same shape (features, **params) -> (mask, keep) and list it here.
-STRATEGIES = {"spy_ema": spy_ema, ORR: orr.opening_range_reversal}
+# same shape (features, **params) -> (mask, keep) and list it here. auction_reclaim is a
+# small state machine instead: (features, minutes, day, **params) -> (mask, triggers, funnel).
+STRATEGIES = {"spy_ema": spy_ema, ORR: orr.opening_range_reversal, AR: ar.auction_reclaim}
 
 
 @contextmanager
@@ -81,6 +86,8 @@ def build_candidate_rows(bars, idx, strategy, config, segment):
     rows["ref_close"] = b["close"]
     for name, values in config["keep"].items():
         rows[name] = values[idx]
+    if "triggers" in config:  # per-trigger state the strategy recorded when each signal fired
+        rows = pd.concat([rows, config["triggers"].loc[idx].reset_index(drop=True)], axis=1)
     return rows
 
 
@@ -91,6 +98,7 @@ def empty_candidates(config, barriers=False):
               "segment": "str", "session": "datetime64[ns]", "bar_start": utc, "signal_time": utc, "ref_close": float}
     columns = {k: pd.Series(dtype=d) for k, d in dtypes.items()}
     columns |= {k: pd.Series(v[:0]) for k, v in config["keep"].items()}
+    columns |= {k: pd.Series(dtype=d) for k, d in (config["triggers"].dtypes.items() if "triggers" in config else ())}
     columns |= {k: pd.Series(dtype=float) for k in outcomes.OUTCOME_COLUMNS}
     if barriers:
         columns |= {k: pd.Series(dtype=d) for k, d in outcomes.BARRIER_COLUMNS.items()}
@@ -100,19 +108,27 @@ def empty_candidates(config, barriers=False):
 def evaluate_segment(segment, configs, bars, rth, strategy, timings, opening=None, barriers=False):
     """Candidate rows + outcomes for each config within one segment, and their summaries.
 
-    Outcomes are computed once for the union of triggered bars across configs, then
-    shared: they depend only on the trigger bar (and, for the opening-range reversal,
-    its session's side and levels), never on the configuration. `opening` (per-session
-    table) switches the summary to one row per side and pattern with session counts.
+    Forward outcomes are computed once for the union of triggered bars across configs,
+    then shared: they depend only on the trigger bar and its side, never on the
+    configuration. The opening-range reversal's barrier levels are shared the same way;
+    auction_reclaim's frozen stop/target differ by variant, so its barrier paths are per
+    configuration. `opening` (per-session table) switches the summary to one row per side
+    and pattern with session counts; auction_reclaim uses one row per side with its setup
+    funnel.
     """
+    is_ar = strategy == AR
     tables, summaries = [], []
     with timed(timings, "outcomes"):
         union = np.unique(np.concatenate([c["idx"][segment["name"]] for c in configs]))
         if union.size:
             at = bars.iloc[union]
-            side = at["side_sign"].to_numpy() if "side_sign" in bars else None
+            if is_ar:  # a bar can trigger only one side (long needs close > open, short close < open)
+                side = pd.concat([c["triggers"]["side_sign"] for c in configs]).groupby(level=0).first()
+                side = side.loc[union].to_numpy()
+            else:
+                side = at["side_sign"].to_numpy() if "side_sign" in bars else None
             shared = outcomes.forward_outcomes(rth, at["bar_end"], at["close"], at["session_close"], segment["end"], side)
-            if barriers:
+            if barriers and not is_ar:
                 stop, target = orr.barrier_levels(bars, union)
                 exits = outcomes.barrier_exits(rth, at["bar_end"], side, stop, target, at["session_close"],
                                                segment["end"])
@@ -122,7 +138,13 @@ def evaluate_segment(segment, configs, bars, rth, strategy, timings, opening=Non
             idx = c["idx"][segment["name"]]
             if idx.size:
                 rows = build_candidate_rows(bars, idx, strategy, c, segment)
-                table = pd.concat([rows, shared.loc[idx].reset_index(drop=True)], axis=1)
+                parts = [rows, shared.loc[idx].reset_index(drop=True)]
+                if barriers and is_ar:
+                    parts.append(outcomes.barrier_exits(
+                        rth, rows["signal_time"], rows["side_sign"], rows["frozen_stop"], rows["frozen_target"],
+                        bars["session_close"].iloc[idx], segment["end"],
+                        min_reward_risk=ar.RULES[c["params"]["rules"]]["min_reward_risk"]))
+                table = pd.concat(parts, axis=1)
             else:
                 table = empty_candidates(c, barriers)
             tables.append(table)
@@ -131,7 +153,10 @@ def evaluate_segment(segment, configs, bars, rth, strategy, timings, opening=Non
             base = {"strategy": strategy, "config": c["label"], **c["params"], "segment": segment["name"],
                     "role": segment["role"], "first_session": segment["first"].date(),
                     "last_session": segment["last"].date()}
-            if opening is None:
+            if is_ar:
+                counts = ar.funnel_counts(c["funnel"].loc[segment["first"]:segment["last"]])
+                summaries += [{**base, **row} for row in report.summarize_sides(table, counts, ar.PATTERNS, barriers)]
+            elif opening is None:
                 summaries.append({**base, **report.summarize(table)})
             else:
                 counts = orr.opening_counts(opening.loc[segment["first"]:segment["last"]], c["params"]["threshold"])
@@ -147,34 +172,53 @@ def select_config(summaries, horizon, min_labeled):
 
 def run_study(minutes, sessions, *, strategy="spy_ema", fasts=(9,), slows=(21,), daily_filter=True,
               thresholds=(orr.BASELINE_THRESHOLD,), barriers=False, bar_minutes=5, min_coverage=0.8,
-              split_date=None, min_labeled=30, select_horizon=30, timings=None):
+              split_date=None, min_labeled=30, select_horizon=30, location=ar.BASELINE["location"],
+              profile_bins=ar.BASELINE["profile_bins"], rvol_filter=True, compare=False, rules="baseline",
+              timings=None):
     """Features -> triggers -> candidate outcomes -> summaries. No file I/O.
 
     spy_ema uses fasts/slows/daily_filter; opening_range_reversal uses thresholds and
-    barriers, with 5-minute bars and one summary row per side and pattern.
+    barriers, with 5-minute bars and one summary row per side and pattern. auction_reclaim
+    uses rules/location/profile_bins/rvol_filter (or the five fixed `compare` variants of one
+    rule set) and barriers, with one summary row per side; nothing is selected after a split.
     """
     timings = {} if timings is None else timings
-    is_orr = strategy == ORR
+    is_orr, is_ar = strategy == ORR, strategy == AR
     if is_orr:
         configs, rejected = orr.make_configs(thresholds), []
+    elif is_ar:
+        configs, rejected = ar.make_configs(location, profile_bins, rvol_filter, compare, rules), []
     else:
         configs, rejected = make_configs(fasts, slows, daily_filter)
         if not configs:
             raise SystemExit(f"No valid configurations: every pair has fast >= slow ({', '.join(rejected)}).")
 
-    opening = None
+    opening = day = None
     with timed(timings, "features"):
-        periods = [] if is_orr else sorted({c["params"]["fast"] for c in configs} | {c["params"]["slow"] for c in configs})
+        periods = ([] if is_orr or is_ar else
+                   sorted({c["params"]["fast"] for c in configs} | {c["params"]["slow"] for c in configs}))
         rth, bars, daily, info = features.build_features(minutes, sessions, bar_minutes, periods,
                                                          DAILY_EMA_PERIOD, min_coverage, orr.ATR_PERIOD)
         if is_orr:
             bars, opening = orr.add_features(bars, rth, daily, sessions)
+        elif is_ar:  # computed once and shared by every variant
+            bars, rth, day = ar.add_features(bars, rth, daily, sessions, [c["params"]["profile_bins"] for c in configs])
+            study_minutes = rth[rth["session"].isin(sessions.index[sessions["in_study"]])]
+            approx = ~study_minutes.groupby("session")["vwap_vendor_ok"].min().astype(bool)
+            info.update(vwap_approx_sessions=[str(d.date()) for d in approx.index[approx]],
+                        profile_status=day.loc[day["in_study"], "profile_status"].value_counts().to_dict())
     segments = make_segments(sessions, split_date)
+    if is_ar and split_date is not None:
+        segments[0]["role"] = "comparison"  # compared, never used to pick a winner
 
     with timed(timings, "triggers"):
         in_segment = {s["name"]: bars["session"].between(s["first"], s["last"]).to_numpy() for s in segments}
         for c in configs:
-            mask, c["keep"] = STRATEGIES[strategy](bars, **c["params"])
+            if is_ar:
+                mask, c["triggers"], c["funnel"] = ar.auction_reclaim(bars, rth, day, **c["params"])
+                c["keep"] = {}
+            else:
+                mask, c["keep"] = STRATEGIES[strategy](bars, **c["params"])
             c["idx"] = {name: np.flatnonzero(mask & inside) for name, inside in in_segment.items()}
 
     tables, summaries = evaluate_segment(segments[0], configs, bars, rth, strategy, timings, opening, barriers)
@@ -189,6 +233,14 @@ def run_study(minutes, sessions, *, strategy="spy_ema", fasts=(9,), slows=(21,),
                                                              opening, barriers)
             tables += [t[t["side"].map(selected).eq(t["config"])] for t in later_tables]
             summaries += [r for r in later_summaries if selected[r["side"]] == r["config"]]
+    elif split_date is not None and is_ar:
+        # No selection: the variants are compared on the earlier segment only, and the configuration fixed
+        # in advance (the baseline, or the single one requested) is the only one evaluated on the later segment.
+        selected = configs[0]["label"]
+        later_tables, later_summaries = evaluate_segment(segments[1], configs[:1], bars, rth, strategy, timings,
+                                                         barriers=barriers)
+        tables += later_tables
+        summaries += later_summaries
     elif split_date is not None:
         selected = select_config(summaries, select_horizon, min_labeled)
         if selected is not None:
@@ -201,7 +253,7 @@ def run_study(minutes, sessions, *, strategy="spy_ema", fasts=(9,), slows=(21,),
     candidates = pd.concat(non_empty, ignore_index=True) if non_empty else empty_candidates(configs[0], barriers)
     return {"candidates": candidates, "summary": pd.DataFrame(summaries), "selected": selected,
             "configs": [c["label"] for c in configs], "rejected": rejected, "segments": segments, "info": info,
-            "bars": bars}
+            "bars": bars, "minutes": rth, "day": day}
 
 
 ORR_DEFINITION = {
@@ -229,15 +281,85 @@ ORR_BARRIERS = {
     "friction_bps_per_side": list(outcomes.COST_BPS),
     "friction_note": "illustrative sensitivity, not calibrated costs; excludes borrow costs",
 }
+AR_DEFINITION = {
+    "inspiration": "failed-auction reversion model in Fabio Valentini's published Auction Market playbook "
+                   "(https://www.chartfanatics.com/strategies/auction-market-strategy); our own deterministic "
+                   "approximation, not his method, and no claim about his performance",
+    "thresholds": "every numeric threshold is a research default, not a verified rule of his",
+    "order_flow": "NOT observed: relative volume is total-volume intensity and the candle filter is a shape rule; "
+                  "neither measures aggressive buyers/sellers, absorption or cumulative delta",
+    "profile": f"{volume_profile.PROFILE_METHOD} (not traded volume at price): the previous XNYS session's complete "
+               "regular-session minutes (all expected minutes present), equal bins from its low to its high, each "
+               "minute's volume spread uniformly over its [low, high]; POC = highest bin's center (ties: lower); "
+               f"{volume_profile.VALUE_AREA_FRACTION:.0%} value area grown from POC by the larger adjacent bin (ties: "
+               "lower first); frozen for the session; an unavailable profile is never replaced by an older session",
+    "atr": f"A = TA-Lib ATR({ar.ATR_PERIOD}) of completed regular-session daily bars through the previous session; "
+           f"b = {ar.BUFFER_ATR} A, d = {ar.RETEST_ATR} A; A missing or <= 0 skips the session",
+    "vwap": "session VWAP reset at each open: cumulative Massive minute vwap x volume while every positive-volume "
+            "minute so far has it; otherwise HLC3 x volume over the whole observed prefix, labeled "
+            f"{ar.APPROX_VWAP}; read at the signal bar's completion and exactly 15 minutes earlier with one method",
+    "relative_volume": f"5-minute bar volume / median volume of the same session-relative slot over the "
+                       f"{ar.RVOL_SESSIONS} preceding sessions (today excluded; >= {ar.RVOL_MIN_OBS} complete "
+                       "observations; positive median); total-volume intensity, not signed flow",
+    "balance": f">= {ar.BALANCE_MIN_INSIDE} of the {ar.BALANCE_BARS} complete consecutive same-session bars before "
+               "the excursion close inside [VAL, VAH]",
+    "excursion": "long: close < VAL - b after a close that was not (fresh break); short: close > VAH + b likewise; "
+                 "the extreme is tracked from the excursion bar through the reclaim bar",
+    "reclaim": f"first bar within the next {ar.RECLAIM_BARS}: long close in (VAL + b, POC) and close > open; short "
+               "close in (POC, VAH - b) and close < open; POC reached first expires the setup; no signal on it",
+    "retest": "first bar within the rule set's retest window after the reclaim overlapping [edge - d, edge + d] "
+              "(or the frozen reclaim LVN), closing back inside (VAL + b, POC) / (POC, VAH - b), passing every filter",
+    "invalidation": "checked first on every bar after the reclaim, including the trigger bar: extreme breached, POC "
+                    "touched, or close beyond the excursion threshold",
+    "confirmation": "direction of the trade, |close - open| / range >= body_min, (close - low) / range (long) or "
+                    f"(high - close) / range (short) >= close_location_min, relative volume >= {ar.RVOL_MIN} "
+                    "(unless disabled); zero-range candles and unavailable inputs skip",
+    "vwap_filter": f"long: close < VWAP and VWAP - VWAP 15 min earlier >= -{ar.VWAP_SLOPE_ATR} A; short: close > "
+                   f"VWAP and that change <= {ar.VWAP_SLOPE_ATR} A (experimental)",
+    "levels": f"stop = excursion extreme -/+ {ar.STOP_ATR} A; target = previous-session POC; positive risk and "
+              "reward with reward/risk >= min_reward_risk at the signal close; frozen at emission",
+    "signal_window": "signal bars complete from 09:50 ET through the rule set's last time, inclusive; one candidate "
+                     "per side per session regardless of outcome; one active setup at a time; missing/incomplete "
+                     "bar, invalidation or expiry resets and evaluation resumes on the following bar",
+    "rules": {name: {"signal_bars_complete_et": f"09:50-{pd.Timestamp('09:30') + r['signal_last']:%H:%M}",
+                     **{k: v for k, v in r.items() if k != "signal_last"}} for name, r in ar.RULES.items()},
+    "loose_rules_note": "fixed after seeing only 2024 signal counts under candidate relaxations, never outcomes",
+    "location": f"value_edge: the band [edge - d, edge + d]; reclaim_lvn: at the reclaim only, a {ar.LVN_BINS}-bin "
+                "bar-approximated profile of the minutes from the excursion-extreme bar through the reclaim; LVN = "
+                "positive volume, [1,2,1]/4-smoothed volume below both neighbors and <= half the smaller of the "
+                "largest smoothed volumes on each side (first/last two bins excluded), center inside prior value "
+                "and behind the reclaim close; nearest the reclaimed edge (ties lower); no node = no setup",
+    "outcomes": "gross directional signal response from the signal bar close (side x raw return); not P&L",
+}
+AR_BARRIERS = {
+    "entry": "open of the minute starting at signal completion (idealized; never the retest low/high)",
+    "levels": "frozen stop and target from the signal; entry_status invalid when the actual entry breaks the "
+              "geometry or gives reward/risk below the rule set's min_reward_risk (the candidate is kept, nothing "
+              "replaces it)",
+    "exit": "stop, target or regular-session close; first touch in time order; later open beyond stop exits at that "
+            "open; beyond target exits at target; both in one minute = ambiguous, stop first; gaps = unresolved; no "
+            "stop moves, trailing, scaling or compounding",
+    "friction_bps_per_side": list(outcomes.COST_BPS),
+    "friction_note": "illustrative sensitivity, not calibrated costs; short borrow feasibility and cost not modeled",
+}
 
 
 def settings_for(args, sessions, source, results):
     study = sessions[sessions["in_study"]]
     info = results["info"]
-    is_orr = args.strategy == ORR
-    strategy = ({"thresholds": args.threshold, "baseline_threshold": orr.BASELINE_THRESHOLD,
-                 "definition": ORR_DEFINITION, "barriers": ORR_BARRIERS if args.barriers else None}
-                if is_orr else {"daily_ema_period": DAILY_EMA_PERIOD})
+    is_orr, is_ar = args.strategy == ORR, args.strategy == AR
+    if is_orr:
+        strategy = {"thresholds": args.threshold, "baseline_threshold": orr.BASELINE_THRESHOLD,
+                    "definition": ORR_DEFINITION, "barriers": ORR_BARRIERS if args.barriers else None}
+    elif is_ar:
+        strategy = {"variants": {c["label"]: c["params"] for c in ar.make_configs(
+                        args.location, args.profile_bins, args.rvol_filter, args.compare, args.rules)},
+                    "baseline": ar.BASELINE, "profile_method": volume_profile.PROFILE_METHOD,
+                    "definition": AR_DEFINITION, "barriers": AR_BARRIERS if args.barriers else None,
+                    "profile_status_study_sessions": info["profile_status"],
+                    "vwap_approximation_sessions": info["vwap_approx_sessions"]}
+    else:
+        strategy = {"daily_ema_period": DAILY_EMA_PERIOD}
     return {
         "ticker": args.ticker.upper(),
         "strategy": args.strategy,
@@ -258,10 +380,15 @@ def settings_for(args, sessions, source, results):
         "excursion_minutes": outcomes.EXCURSION_MINUTES,
         "split_date": args.split_date,
         "selection": None if args.split_date is None else {
-            "metric": f"mean_{args.select_horizon}m_pct on the earlier segment"
+            "metric": "none: variants are compared on the earlier segment only, and the configuration fixed in "
+                      "advance is the one evaluated on the later segment" if is_ar else
+                      f"mean_{args.select_horizon}m_pct on the earlier segment"
                       + (", chosen separately for long and short" if is_orr else ""),
-            "min_labeled_candidates": args.min_labeled, "selected": results["selected"]},
+            "min_labeled_candidates": None if is_ar else args.min_labeled,
+            ("evaluated_later" if is_ar else "selected"): results["selected"]},
         "interpretation": ("exploratory / in-sample: no split date" if args.split_date is None else
+                           "earlier segment: diagnostic comparison; later segment: the fixed configuration only; a "
+                           "later period inspected repeatedly is not a pristine holdout" if is_ar else
                            "select on earlier segment, evaluate the pick once on the later segment; a later "
                            "period inspected repeatedly is not a pristine holdout"),
         "coverage": {k: info[k] for k in ("rth_minutes_expected", "rth_minutes_present", "bars_usable",
@@ -298,6 +425,19 @@ def print_report(args, sessions, source, results, timings, out_dir):
         print(f"daily     prior-session ATR{orr.ATR_PERIOD} unavailable for {info['study_sessions_missing_atr']} "
               f"of {len(study)} study sessions")
         print_orr_report(args, results)
+    elif args.strategy == AR:
+        status = ", ".join(f"{k} {v}" for k, v in sorted(info["profile_status"].items()))
+        approx = info["vwap_approx_sessions"]
+        print(f"bars      {info['bars_usable']:,} usable (dropped {info['bars_dropped_low_coverage']} below "
+              f"{args.min_coverage:.0%} minute coverage); a setup needs every 5-minute bar complete (5 of 5 minutes)")
+        print(f"daily     prior-session ATR{ar.ATR_PERIOD} unavailable for {info['study_sessions_missing_atr']} "
+              f"of {len(study)} study sessions")
+        print(f"profile   previous-session {volume_profile.PROFILE_METHOD} (minute volume spread over each minute's "
+              f"range; not traded volume at price): {status}")
+        print(f"vwap      Massive minute vwap, except {ar.APPROX_VWAP} (from the first minute lacking it) in "
+              f"{len(approx)} of {len(study)} study sessions"
+              + (f": {', '.join(approx[:8])}{' ...' if len(approx) > 8 else ''}" if approx else ""))
+        print_ar_report(args, results)
     else:
         print(f"bars      {info['bars_usable']:,} usable (dropped {info['bars_dropped_low_coverage']} below "
               f"{args.min_coverage:.0%} minute coverage); study bars missing {ema_gaps}")
@@ -309,9 +449,10 @@ def print_report(args, sessions, source, results, timings, out_dir):
     print(f"\n{report.CAVEAT}")
     print("timings   " + " · ".join(f"{k} {timings.get(k, 0):.2f}s"
                                    for k in ("data", "features", "triggers", "outcomes", "reporting")))
-    charts = f", {len(results.get('candidate_charts', []))} candidate chart(s)" if args.strategy == ORR else ""
+    charts = f", {len(results.get('candidate_charts', []))} candidate chart(s)" if args.strategy in (ORR, AR) else ""
+    stability = ", stability.csv" if args.strategy == AR else ""
     print(f"outputs   {out_dir}/: candidates.parquet ({len(results['candidates'])} rows), summary.csv, "
-          f"settings.json, chart.png{charts}")
+          f"settings.json{stability}, chart.png{charts}")
 
 
 def print_ema_report(args, results):
@@ -365,12 +506,48 @@ def print_orr_report(args, results):
           "correlated: separate runs are not independent evidence.")
 
 
+def print_ar_report(args, results):
+    summary, segs = results["summary"], results["segments"]
+    print("\nSetup funnel (aggregate counts; at most one signal per side and session)")
+    print(report.format_setup_funnel(summary))
+    first = summary[summary["segment"] == segs[0]["name"]]
+    if args.split_date is None:
+        print("\nExploratory / in-sample (no --split-date). Gross directional signal response from the signal bar "
+              "close, NOT strategy P&L; long and short kept separate")
+    else:
+        print(f"\nDiagnostic comparison on the earlier segment {segs[0]['first'].date()} to "
+              f"{segs[0]['last'].date()} (nothing is selected). Gross signal response, NOT strategy P&L")
+    print(report.format_table(first))
+    if args.barriers:
+        print(f"\nBarrier comparison ({segs[0]['name']}): {report.BARRIER_CAVEAT} "
+              "entry invalid = broken geometry or reward/risk below the rule set's minimum at the actual entry.")
+        print(report.format_barrier_table(first))
+    if args.split_date is not None:
+        later = summary[summary["segment"] == "later"]
+        print(f"\n{results['selected']} (fixed in advance, not selected) on the later segment "
+              f"{segs[1]['first'].date()} to {segs[1]['last'].date()}:")
+        print(report.format_table(later))
+        if args.barriers:
+            print(report.format_barrier_table(later))
+        print("A later period you keep re-inspecting stops being a clean holdout.")
+    shown = results["configs"][0]
+    stability = results["stability"]
+    print(f"\nStability for {shown} (periods with candidates; small counts are noise, not evidence)")
+    print(report.format_stability(stability[stability["config"] == shown]))
+    print(f"Profile levels are a {volume_profile.PROFILE_METHOD}, not traded volume at price. Relative volume and "
+          "candle shape are not order flow (no aggressor side, absorption or delta). Short-side rows do not "
+          "establish borrow availability or executable short returns. SPY and QQQ are correlated: separate runs "
+          "are not independent evidence.")
+
+
 def execute(args, minutes, sessions, source, timings):
     """Run the study on already-loaded minutes, write outputs, print the summary."""
     results = run_study(minutes, sessions, strategy=args.strategy, fasts=args.fast, slows=args.slow,
                         daily_filter=args.daily_filter, thresholds=args.threshold, barriers=args.barriers,
                         bar_minutes=args.bar_minutes, min_coverage=args.min_coverage, split_date=args.split_date,
-                        min_labeled=args.min_labeled, select_horizon=args.select_horizon, timings=timings)
+                        min_labeled=args.min_labeled, select_horizon=args.select_horizon, location=args.location,
+                        profile_bins=args.profile_bins, rvol_filter=args.rvol_filter, compare=args.compare,
+                        rules=args.rules, timings=timings)
     ticker = args.ticker.upper()
     with timed(timings, "reporting"):
         results["candidates"].insert(0, "ticker", ticker)
@@ -380,17 +557,23 @@ def execute(args, minutes, sessions, source, timings):
         if args.strategy == ORR:
             chart_config = configs[0] if len(configs) == 1 and args.split_date is None else None
             picked = bool(selected) and any(selected.values())
+        elif args.strategy == AR:
+            chart_config = configs[0] if len(configs) == 1 or args.split_date else None
+            picked = False
         else:
             chart_config = selected or (configs[0] if len(configs) == 1 else None)
             picked = bool(selected)
         title = f"{ticker} · {args.strategy} · {chart_config or f'{len(configs)} configurations'}"
         if picked:
             context = "Selected on the earlier segment only, then evaluated once on the later segment."
+        elif args.split_date and args.strategy == AR:
+            context = (f"{configs[0]}, fixed in advance (nothing selected): earlier (comparison) and later "
+                       "(evaluation) segments.")
         elif args.split_date:
             context = "Split date given but no configuration qualified: earlier (selection) segment only."
         else:
             context = "In-sample / exploratory: no split date."
-        if args.strategy == ORR:
+        if args.strategy in (ORR, AR):
             context += " Gross directional signal response, not P&L; long and short separate."
         out = report.write_outputs(args.out, results["candidates"], results["summary"],
                                    settings_for(args, sessions, source, results), title, context,
@@ -401,6 +584,13 @@ def execute(args, minutes, sessions, source, timings):
             cands = results["candidates"]
             results["candidate_charts"] = report.plot_candidates(out, cands[cands["config"] == shown],
                                                                  results["bars"], ticker)
+        elif args.strategy == AR:
+            cands = results["candidates"]
+            results["stability"] = report.stability(cands, args.barriers)
+            results["stability"].to_csv(out / "stability.csv", index=False)
+            # First candidates in time for the baseline (else the single) configuration; never picked by outcome.
+            results["candidate_charts"] = report.plot_auction_candidates(
+                out, cands[cands["config"] == configs[0]], results["bars"], results["minutes"], ticker)
     print_report(args, sessions, source, results, timings, out)
     return results
 
@@ -413,7 +603,7 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Quick intraday signal study on Massive minute bars "
                                             "(a signal study, not a backtest).")
     p.add_argument("--strategy", choices=sorted(STRATEGIES), default="spy_ema")
-    p.add_argument("--ticker", default="SPY", help="one US stock/ETF per run (default SPY)")
+    p.add_argument("--ticker", help="one US stock/ETF per run (default SPY; QQQ for auction_reclaim)")
     p.add_argument("--start", type=iso_date, required=True, help="first study date, YYYY-MM-DD")
     p.add_argument("--end", type=iso_date, required=True, help="last study date, YYYY-MM-DD (inclusive)")
     p.add_argument("--bar-minutes", type=int, default=5, help="intraday bar size, anchored to each session open")
@@ -425,7 +615,20 @@ def parse_args(argv=None):
                    help="opening_range_reversal: opening range / prior ATR14 gate(s); baseline 0.25, "
                         "small sweep 0.20 0.25 0.30")
     p.add_argument("--barriers", action="store_true",
-                   help="opening_range_reversal: add the fixed stop/target comparison (idealized, not P&L)")
+                   help="opening_range_reversal / auction_reclaim: add the fixed stop/target comparison "
+                        "(idealized, not P&L)")
+    p.add_argument("--rules", choices=sorted(ar.RULES), default=ar.BASELINE["rules"],
+                   help="auction_reclaim: rule set (default baseline; loose = signals until 15:30, 6-bar retest, "
+                        "milder candle, reward/risk >= 1.0)")
+    p.add_argument("--location", choices=ar.LOCATIONS, default=ar.BASELINE["location"],
+                   help="auction_reclaim: retest location (default value_edge)")
+    p.add_argument("--profile-bins", type=int, default=ar.BASELINE["profile_bins"],
+                   help="auction_reclaim: previous-session profile bins (default 48)")
+    p.add_argument("--rvol-filter", action=argparse.BooleanOptionalAction, default=True,
+                   help="auction_reclaim: require relative volume >= 1.20 on the retest bar (default on)")
+    p.add_argument("--compare", action="store_true",
+                   help="auction_reclaim: run the five fixed diagnostic variants of the chosen rule set (its "
+                        "base, reclaim_lvn, rvol filter off, 32 and 64 bins) on shared data")
     p.add_argument("--split-date", type=iso_date, help="select on sessions before this date, evaluate the pick on sessions from it")
     p.add_argument("--min-labeled", type=int, default=30,
                    help="min candidates with an available selection-horizon outcome to qualify (default 30)")
@@ -442,10 +645,19 @@ def parse_args(argv=None):
         p.error("need --bar-minutes >= 1, --warmup-sessions >= 0 and 0 < --min-coverage <= 1")
     if min(args.fast + args.slow) < 2:
         p.error("EMA periods must be >= 2")
-    if args.strategy == ORR and args.bar_minutes != orr.BAR_MINUTES:
-        p.error(f"{ORR} uses {orr.BAR_MINUTES}-minute signal bars (--bar-minutes {orr.BAR_MINUTES})")
-    if args.strategy != ORR and args.barriers:
-        p.error(f"--barriers applies only to --strategy {ORR}")
+    if args.strategy in (ORR, AR) and args.bar_minutes != orr.BAR_MINUTES:
+        p.error(f"{args.strategy} uses {orr.BAR_MINUTES}-minute signal bars (--bar-minutes {orr.BAR_MINUTES})")
+    if args.strategy not in (ORR, AR) and args.barriers:
+        p.error(f"--barriers applies only to --strategy {ORR} or {AR}")
+    defaults = {k: v for k, v in ar.BASELINE.items() if k != "rules"}
+    ar_options = {"location": args.location, "profile_bins": args.profile_bins, "rvol_filter": args.rvol_filter}
+    if args.strategy != AR and (args.compare or ar_options != defaults or args.rules != ar.BASELINE["rules"]):
+        p.error(f"--rules, --location, --profile-bins, --no-rvol-filter and --compare apply only to --strategy {AR}")
+    if args.compare and ar_options != defaults:
+        p.error("--compare runs the fixed variants; leave --location, --profile-bins and --rvol-filter at defaults")
+    if args.profile_bins < 3:
+        p.error("--profile-bins must be >= 3")
+    args.ticker = args.ticker or ("QQQ" if args.strategy == AR else "SPY")
     if min(args.threshold) <= 0:
         p.error("--threshold values must be > 0")
     return args
