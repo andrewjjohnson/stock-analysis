@@ -5,7 +5,8 @@ Every background session uses one designed minute layout. Its bar-approximated p
 (48 bins of 0.125 over 96..102, a triangle of volume around 99.0625 and ties that expand
 lower first) has VAL 98.25, POC 99.0625 and VAH 99.75. Its daily ATR(14) is exactly 6.0,
 so b = 0.12, d = 0.18 and the stop offset 0.01 A = 0.06. The vendor minute `vwap` is
-(high + low) / 2, which differs from HLC3, so the two VWAP methods can be told apart.
+low + 0.3 x (high - low): inside each minute's range but skewed low, so a session VWAP
+built from it differs from the HLC3 approximation and the two methods can be told apart.
 """
 
 import numpy as np
@@ -81,7 +82,7 @@ def build(sessions, designed=None, drop=(), volume_scale=None):
         rows += [(s["open"] + m * MIN, o, h, l, c, v * scale) for m, (o, h, l, c, v) in enumerate(minutes)]
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = df["ts"].dt.as_unit("ns")
-    df["vwap"] = (df["high"] + df["low"]) / 2
+    df["vwap"] = df["low"] + 0.3 * (df["high"] - df["low"])
     df["transactions"] = 10
     return df[~df["ts"].isin([et(t) for t in drop])].reset_index(drop=True)
 
@@ -228,6 +229,31 @@ def test_setup_sequence(name, bars, drop, expected, counter):
         assert row["excursions"] == 0  # no setup ever started
     if name.startswith("reclaim alone"):
         assert row["reclaims"] == 1 and row["excursions"] == 1
+
+
+def test_snapshots_and_outcomes_only_for_emitted_signals(monkeypatch):
+    sessions = one_session()
+    calls = {"snapshot": 0, "outcomes": 0}
+    real_snapshot, real_outcomes = ar.candidate_snapshot, outcomes.forward_outcomes
+
+    def snapshot(*args):
+        calls["snapshot"] += 1
+        return real_snapshot(*args)
+
+    def forward(*args):
+        calls["outcomes"] += 1
+        return real_outcomes(*args)
+
+    monkeypatch.setattr(ar, "candidate_snapshot", snapshot)
+    monkeypatch.setattr(outcomes, "forward_outcomes", forward)
+    # Reclaimed setups that reach the retest window but never qualify build nothing.
+    for bars in ([LONG_IN] * 4 + [EXC, OUT, (*RECLAIM, 2.0), LONG_IN, LONG_IN, LONG_IN],
+                 LONG[:7] + [(*RETEST[:4], 1.1)] + [LONG_IN] * 2):
+        result = study(build(sessions, {"2024-03-08": bars}), sessions, barriers=True)
+        assert result["candidates"].empty and funnel(result)["reclaims"] == 1
+    assert calls == {"snapshot": 0, "outcomes": 0}
+    study(build(sessions, {"2024-03-08": LONG}), sessions)
+    assert calls == {"snapshot": 1, "outcomes": 1}
 
 
 def test_relative_volume_filter_can_be_disabled_and_needs_ten_prior_observations():

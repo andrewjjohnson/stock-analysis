@@ -2,7 +2,8 @@
 
 Runs the same pipeline as run.py (EMA single config, sweep and split; opening-range
 reversal baseline and threshold sweep with split, both with barriers; the auction reclaim
-comparison with split and barriers) on a seeded random
+comparison with split and barriers), then sauce.py's VWAP + Sauce simulation (the brief's
+defaults, and the four --compare variants with every optional module on), on a seeded random
 walk laid on the real XNYS calendar, labeled ticker SYNTHETIC. It checks the
 workflow end to end; its numbers say nothing about any real market.
 
@@ -11,6 +12,7 @@ workflow end to end; its numbers say nothing about any real market.
 
 import features
 import run
+import sauce
 import synthetic
 
 START, END, SPLIT = "2024-01-02", "2024-12-31", "2024-07-01"
@@ -24,6 +26,11 @@ RUNS = {
                   "--split-date", SPLIT],
     "auction_reclaim": ["--strategy", "auction_reclaim", "--barriers", "--compare", "--split-date", SPLIT],
 }
+SAUCE_RUNS = {
+    "sauce": [],
+    "sauce_all": ["--compare", "--continuation", "--vwap-to-vwap", "--reentry", "--fade-entry", "--trendline-confirm",
+                  "--random-baseline", "20"],
+}
 
 
 def main():
@@ -36,6 +43,11 @@ def main():
         args = run.parse_args(["--ticker", "SYNTHETIC", "--start", START, "--end", END,
                                "--out", f"output/demo/{name}", *extra])
         run.execute(args, minutes, sessions, SOURCE, dict(timings))
+    for name, extra in SAUCE_RUNS.items():
+        print(f"\n{'=' * 30} DEMO: {name} · SYNTHETIC DATA, NOT MARKET DATA {'=' * 30}")
+        args = sauce.parse_args(["--ticker", "SYNTHETIC", "--start", START, "--end", END, "--charts", "3",
+                                 "--out", f"output/demo/{name}", *extra])
+        sauce.execute(args, minutes, sessions, SOURCE, dict(timings))
 
 
 if __name__ == "__main__":

@@ -121,6 +121,96 @@ result, and coverage counts.
   Changing the dates or `--warmup-sessions` means a new download. There is no incremental
   ingestion, by design.
 
+## VWAP + Sauce (`sauce.py`, `strategies/vwap_sauce.py`)
+
+A trade simulation, kept apart from `run.py` because candidates and forward outcomes can't
+express its rules: entries at the next open, moving targets, stops, re-entries and one
+position at a time. README.md has the rules, the table of the brief's assumptions and the
+choices made where the brief is silent.
+
+**Contracts**
+
+- **`vwap_sauce.anchored_vwap(bars, sessions, lookback)`** returns `(vwap, sigma)` arrays
+  aligned with `bars`.
+  - Each value holds per-session sums of v, tp x v and tp^2 x v over the previous
+    `lookback - 1` calendar sessions, plus the current session's cumulative sums through the
+    bar itself. sigma^2 = E[tp^2] - VWAP^2 (population, volume-weighted).
+  - It is NaN until enough earlier sessions exist, or when any of them has no usable bars.
+- **`vwap_sauce.simulate(bars, **params)`** takes usable bars with `session, bar_start,
+  bar_end, open, high, low, close, fast, slow, vwap, sigma, in_study`. It returns the setup
+  log with columns `vwap_sauce.LOG_COLUMNS`, one row per instance and trade.
+  - It simulates only `in_study` rows. Warm-up rows supply only the previous bar's levels.
+  - Tests call it directly with hand-built indicator columns.
+- **`sauce.run_sauce(minutes, sessions, configs, min_coverage, timings)`** returns `log`,
+  `summary`, `monthly`, `bars` (keyed by lookback), `minutes`, `info`, `months` and
+  `configs`. It does no file I/O.
+
+**Per-bar order** (bar i, in time order):
+1. Orders placed at the previous close fill at this bar's open, the exit before the entry.
+2. The price stop and the target are checked inside the bar, against the levels known at
+   bar i-1's close. A bar that opens beyond a level fills at its open; otherwise the fill
+   is at the level. If both are touched, the stop wins and the trade is flagged ambiguous.
+3. The setup states update at the close, and the entry signals are collected.
+4. A close-based exit (structure stop, continuation exit or B head fake) is scheduled for
+   the next open.
+5. At most one entry is scheduled for the next open: A before the continuation before B,
+   and only if the book will be flat by then. Other signals are counted as blocked.
+6. On the session's last bar, the time stop exits at the close, and every setup that
+   isn't holding the position ends as `session_end`.
+
+**Time semantics:**
+- `arm_time`, `slow_parallel_time`, `invalidation_time` and `signal_time` are the bar
+  ends at which each condition became known.
+- `entry_time` is the entry bar's start, since it fills at the open.
+- `exit_time` is the bar start for a fill at an open, and the bar end for a touch or the
+  time stop.
+- `bars_held` counts the bars the position was exposed to. An entry that exits at its own
+  open has 0.
+
+**Decisions and why:**
+- **Separate script.** Wiring it into `run_study` would add a third special case to
+  segments, selection and outcomes. None of them apply, because the configurations are
+  fixed in advance and nothing is selected.
+- **2-minute bars from the minute cache**, not a second download. They share the cache
+  key, and the anchoring and coverage rules are the same as every other bar size. The
+  coverage default is 0.5 because a minute without trades has no Massive bar, and one
+  traded minute is what the trader's chart would show.
+- **The level for an intrabar fill is the previous close's.** The level at bar i includes
+  bar i's own volume and close, so using it would be lookahead.
+- **Intraday setups, re-armed per excursion.** Without the re-arm rule, a setup
+  invalidated while FAST stays outside would re-arm on the next bar and be invalidated
+  again, many times per excursion.
+- **Everything the brief leaves open is a named choice** (`IMPLEMENTATION`), not a hidden
+  default, so the user can argue with each one.
+
+**How correctness was checked (2026-09-30):**
+- Hand-built paths test every rule: arm, parallel, invalidation, re-arm, each entry and
+  exit type, the fills, re-entry, continuation hand-off, B, the one-position rule and
+  sessions.
+- A mirror test checks that the short side reflects the long side exactly.
+- VWAP and sigma were compared with a direct window computation for lookbacks 3 and 4.
+- Each injected bug below made at least one test in `tests/test_vwap_sauce.py` fail:
+  - the target level taken from the current bar
+  - VWAP ignoring earlier sessions
+  - a scaled sigma
+  - no SLOW-crossing invalidation
+  - re-arming without FAST coming back inside
+  - an ambiguous bar counted as the target
+  - the flat test ignoring its threshold
+  - entries filled at the signal bar
+  - no exits on the entry bar
+  - a structure stop filled at the signal close
+  - an upper-band sign error
+  - `setup_extreme` updating after the signal
+  - a continuation entry without a pullback
+  - no one-position rule
+  - a fade without a green day
+  - a last-bar signal filling next session
+  - re-entries off by one
+  - B crosses detected across sessions
+- A real run on cached SPY and QQQ minutes (2022-04-01 to 2024-12-31) was checked by eye
+  against the session charts.
+
 ## How correctness was checked (2026-09-28)
 
 - **Independent recomputation:** 60 sampled demo candidates had their outcomes recomputed

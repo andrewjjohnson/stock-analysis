@@ -2,10 +2,10 @@
 
 A personal proof of concept for quickly testing an intraday stock signal on Massive
 one-minute bars and comparing what happened afterwards. It is a **signal study**, not a
-backtest: no orders, fills, costs, position sizing or P&L (the optional `--barriers`
-comparison of the opening-range reversal and auction reclaim is the one narrow, clearly
-labeled exception). It is
-independent of Quant Forge and shares no code or data with it.
+backtest: no orders, fills, costs, position sizing or P&L. There are two narrow, clearly
+labeled exceptions: the optional `--barriers` comparison of the opening-range reversal and
+auction reclaim, and `sauce.py`, which simulates the VWAP + Sauce trades gross on the
+underlying. It is independent of Quant Forge and shares no code or data with it.
 
 ## Setup
 
@@ -63,8 +63,8 @@ stops before the last regular-session minute of the final requested day, the run
 and nothing is cached. Gaps elsewhere are reported in the coverage lines, never filled.
 
 Offline demo on clearly labeled SYNTHETIC random-walk data (no key, no network); it runs
-the EMA single, sweep and split runs, two opening-range reversal runs and the auction
-reclaim comparison into `output/demo/`:
+the EMA single, sweep and split runs, two opening-range reversal runs, the auction reclaim
+comparison and two VWAP + Sauce runs into `output/demo/`:
 
 ```bash
 uv run python demo.py
@@ -251,6 +251,167 @@ the exit is the stop, the target or the session close, with the same gap, ambigu
 missing-data rules. `entry_status` is `invalid` when the actual entry breaks the geometry
 or gives reward/risk < 1.25; the candidate is kept and nothing replaces it. Long and short
 stay separate. Short borrow feasibility and costs are not modeled.
+
+## VWAP + Sauce (`sauce.py`)
+
+One trader's 2-minute-chart method: a multi-day anchored VWAP with standard-deviation bands,
+plus an 8/48 EMA pair ("sauce"). Unlike the studies above it is a **trade simulation**, so it
+has its own script: entries at the next bar's open, moving band targets, stops, and one
+position at a time. Results are gross price moves per share of the **underlying**, with no
+options, costs or slippage. They are not the trader's options P&L.
+
+```bash
+uv run python sauce.py --ticker SPY --start 2022-04-01 --end 2024-12-31 --out output/sauce_spy
+uv run python sauce.py --ticker SPY --start 2022-04-01 --end 2024-12-31 --compare --out output/sauce_spy_compare
+uv run python sauce.py --ticker SPY --start 2022-04-01 --end 2024-12-31 --continuation --vwap-to-vwap --out output/sauce_spy_all
+```
+
+With the default 120 warm-up sessions, a 2022-04-01 start reuses the auction_reclaim cache
+files. `--compare` runs the two questions the brief asks to test, crossed: VWAP lookback 3
+and 4 sessions, with the slow-parallel requirement on and off. Nothing is selected. Like
+auction_reclaim, 2025 onward has not been run; keep it back until the rules are fixed.
+
+**Indicators** (read when a bar completes; `strategies/vwap_sauce.py`):
+
+- **Bars**: 2-minute bars anchored to each session open, built from the one-minute bars. A
+  bar needs one of its two minutes (`--min-coverage 0.5`). Massive emits no bar for a
+  minute without trades, so that is what a chart shows. Regular hours only.
+- **VWAP**: typical price (H+L+C)/3 x volume, anchored at the open of the session
+  `vwap_lookback_sessions - 1` sessions ago and re-anchored at every open. sigma is the
+  volume-weighted standard deviation of typical price around VWAP over the same window.
+  Bands are VWAP +/- 1, 1.5 and 2 sigma (U1, U1.5, U2 and L1, L1.5, L2). The value is blank
+  if an earlier session in the window has no data.
+- **FAST / SLOW**: TA-Lib EMA 8 / EMA 48 of the 2-minute close, continuous across sessions.
+
+**Setup A**, the band-extension reversal, on the lower band (long). The upper band mirrors
+it as a short, and a test checks that the two sides are exact mirrors.
+
+1. **Arm**: a close with FAST below L2 (price alone below L2 does not arm). `setup_extreme`
+   is the lowest low while armed.
+2. **SLOW goes parallel**: 0 <= SLOW - L2 <= 0.25 sigma, and the least-squares slope of
+   SLOW - L2 over the last 5 bars is >= 0 or smaller in size than 0.02 sigma per bar.
+   **Invalidation**: SLOW closes below L2.
+3. **Optional trendline**: a line fitted to the last 10 SLOW values; confirmation is a
+   close crossing it in the reversal direction.
+4. **Entry**: the first close with FAST back above L2, if SLOW went parallel, fills long at
+   the next bar's open. The optional **fade** enters once SLOW is parallel, while FAST is
+   still below L2, but only when the session's realized P&L is above zero.
+5. **Target**: the moving L1.5 band, re-read every bar (`--extended-target`: L1).
+6. **Stops**: FAST closes back below L2 (the structure stop, filled at the next open);
+   price trades below `setup_extreme` (the price stop); the session's last bar (the time
+   stop).
+7. **Optional re-entry**: after a structure stop, a bar that touches FAST and closes above
+   it re-enters at the next open, at most twice per setup.
+
+**A-continuation** (`--continuation`): while FAST is below L2, a close above FAST and then a
+later close below it go short at the next open. Its price stop is the high of that bounce
+bar (the latest bar that closed above FAST). The trade exits on that stop, when FAST closes
+back above L2 (which hands off to the Setup A long at the same open), or on the time stop.
+
+**B, VWAP to VWAP** (`--vwap-to-vwap`): FAST closing across a ladder level (L2, L1.5, L1,
+VWAP, U1, U1.5, U2) sets a bias toward the next level. The first later bar that touches FAST
+and closes back in the bias direction enters at the next open, with the next level as the
+target. FAST closing back across the crossed level is a head fake: no trade, or an exit at
+the next open. Crosses of the center VWAP are reported separately.
+
+**One position per symbol.** An open position blocks new entries, which are counted as
+blocked. On the same bar, Setup A comes before the continuation, which comes before B.
+
+**The brief's assumptions.** These rules were not stated by the trader. Each is a flag,
+with the brief's default:
+
+| Brief assumption | Flag | Default |
+|---|---|---|
+| regular hours only | none (extended hours are not supported) | on |
+| instrument | `--instrument` | `underlying` |
+| VWAP window, today included | `--vwap-lookback-sessions` | 3 (also test 4) |
+| "near" distance | `--parallel-distance-sigma` | 0.25 |
+| slope window / flat threshold | `--parallel-lookback` / `--slope-threshold` | 5 bars / 0.02 sigma per bar |
+| slow-parallel required | `--[no-]require-slow-parallel` | on |
+| trendline confirmation | `--trendline-confirm` / `--trendline-lookback` | off / 10 |
+| fade entry, only on a green day | `--fade-entry` | off |
+| target band / extended target | `--target-level` (0 = VWAP) / `--extended-target` | 1.5 / off |
+| structure, price and time stops | `--[no-]structure-stop`, `--[no-]price-stop`, `--[no-]time-stop` | all on |
+| re-entry / maximum re-entries | `--reentry` / `--max-reentries` | off / 2 |
+| continuation module | `--continuation` | off |
+| VWAP-to-VWAP module | `--vwap-to-vwap` | off |
+
+**Choices the brief leaves open.** They are made here, listed in
+`vwap_sauce.IMPLEMENTATION`, and written to `settings.json`:
+
+- **Intraday setups**: a setup ends at its session's last bar. A signal on that bar has no
+  next open, so it does not trade.
+- **One setup per excursion**: after a setup ends, FAST must close back inside the band
+  before that side can arm again. Each session starts fresh.
+- **Latching**: slow-parallel and the trendline confirmation stay true once seen while
+  armed. If FAST comes back inside before them, the setup ends without a trade.
+  `--no-latch-slow-parallel` instead needs SLOW to be parallel on the entry bar itself.
+- **Contiguous windows**: the slope and trendline windows must be contiguous and in one
+  session, so neither exists in a session's first 4 bars (9 for the trendline).
+- **Fade and re-entry trades** start with FAST outside the band, so their structure stop
+  applies only after FAST has closed back inside.
+- **Fills**: targets and price stops fill inside the bar against the level known at the
+  previous close. They fill at that level, or at the open if the bar opens beyond it. An
+  entry that opens beyond its target therefore exits at once, for zero; the summary counts
+  these as "exit at the entry open". If one bar touches both the stop and the target, the
+  stop is counted (the ambiguous count); `--ambiguous-fill target` gives the target instead.
+- **Re-entry** follows only a structure stop. While flat, the setup ends if SLOW crosses
+  the band, price trades beyond `setup_extreme` or the target is touched.
+- **Continuation stop**: `setup_extreme` lies on the continuation's favorable side, so its
+  price stop is the bounce bar's high instead (low, for a long). Its FAST-back-inside exit
+  is logged as `structure_stop`.
+- **Experiments, not from the brief**: `--stop-buffer-sigma X` moves the price stop X sigma
+  further away, and `--target-level 0` targets VWAP itself.
+- **B**: when several levels are crossed at once, the outermost counts. A new cross
+  replaces a bias still waiting for its pullback. A cross beyond U2 or L2 has no next level
+  and makes no setup.
+
+**Outputs** (in `--out`):
+
+- `setup_log.csv`: one row per setup instance and trade; a setup without a trade has one
+  row with empty trade columns. Columns:
+  - identity: config, setup (`A` / `A_cont` / `B`), band, side, session, instance
+  - setup times: `arm_time`, `setup_extreme`, `slow_parallel_time`,
+    `trendline_confirm_time`, `pullback_time`
+  - B only: `level_crossed`, `center_cross`
+  - how it ended: `invalidation_time` / `invalidation_reason`, `outcome`, `n_blocked`
+  - per trade: `trade_no`, `signal_time`, `entry_time`, `entry_price`, `entry_type`
+    (standard / fade / reentry), `target_level`, `target_price_at_entry`, `stop_price`,
+    `sigma_at_entry`, `exit_time`, `exit_price`, `exit_reason` (target / structure_stop /
+    price_stop / time_stop), `ambiguous`, `pnl_usd` (per share), `pnl_sigma`, `pnl_pct`,
+    `bars_held`
+- `summary.csv`: one row per configuration, setup and side, and for B also center and
+  off-center. It has setups and trades per month, win rate, average win and loss,
+  expectancy, total and max drawdown (each in $ and in sigma), exit reasons, entry types
+  and how the setups ended. Setup A adds the % of armed setups invalidated by SLOW crossing
+  the band before any entry; B adds the % of head fakes.
+- `monthly.csv`: setups, trades, wins and P&L per setup and month.
+- `entry_baseline.csv` (with `--random-baseline`): the four comparison rows per
+  configuration, with the share of random sets beaten and their 5th-95th percentile.
+- `session_<date>.png`: an overlay for checking trades against the rules. It shows
+  2-minute candles, VWAP, the six bands (the target band in green), FAST and SLOW, with
+  markers for arm, SLOW parallel, invalidation, entry and exit, and one line per setup
+  underneath. The charted sessions are the first `--charts` (default 12) with a Setup A
+  setup or a trade, by time and never by outcome; add others with `--chart-dates`.
+
+**Is the entry better than chance?** `--random-baseline 200` compares Setup A's entries
+with matched random ones and writes `entry_baseline.csv`. Each Setup A trade keeps its side
+and its target and stop distances (in sigma). The comparison has four groups:
+
+- Setup A under its actual rules, for reference.
+- Setup A's entries exited by a fixed bracket at those distances (or the session close).
+- 200 random entries per trade: bar opens in the same session, same side, same bracket.
+- The same entries taken in the opposite direction.
+
+Every bracket is exited the same way, with `outcomes.barrier_exits` on one-minute bars, so
+only the entry differs. The run also reports what share of 2,000 random sets of the same
+size Setup A's average beats. Beating random entries is not the same as making money:
+compare the averages too.
+
+Setup A is rare by design; nothing is loosened to make more trades. On cached SPY and QQQ
+minutes for 2022-04-01 to 2024-12-31, about 15 setups arm per month and 4.5 to 5 of them
+trade with the defaults. The run above prints this frequency every time. Max drawdown is
+over one share per trade, in trade order: a check on the sequence, not portfolio accounting.
 
 ## Output (in `--out`)
 

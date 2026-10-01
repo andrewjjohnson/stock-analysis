@@ -13,6 +13,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 import volume_profile as vp  # noqa: E402
+from strategies.vwap_sauce import BAND_SIGMAS  # noqa: E402
 from outcomes import COST_BPS, EXCURSION_MINUTES, HORIZONS  # noqa: E402
 
 # Chart colors: categorical slots 1-2 (validated pair) plus neutral ink and chrome;
@@ -613,5 +614,144 @@ def _plot_auction_candidate(day, day_minutes, prev_minutes, c, ticker, path):
             fig.text(left + 0.105, y, v, color=INK_2, fontsize=6.5, va="top")
     footer = f"{PROFILE_CAVEAT} {BARRIER_CAVEAT if 'entry_status' in c else CAVEAT}"
     fig.text(0.02, 0.1 / height, textwrap.fill(footer, 130), color=MUTED, fontsize=7, va="bottom")
+    fig.savefig(path, facecolor=SURFACE)
+    plt.close(fig)
+
+
+SAUCE_CAVEAT = ("Gross simulated trades on the underlying, one share: next-bar-open entries, idealized touch fills on "
+                "2-minute bars, no costs, slippage or options pricing. Not options P&L. In-sample / exploratory.")
+
+
+def plot_sauce_sessions(out_dir, log, bars, sessions, ticker, config, params, dates):
+    """VWAP + Sauce overlay per session: candles, VWAP, six bands, FAST, SLOW and setup markers."""
+    paths = []
+    for day in dates:
+        path = Path(out_dir) / f"session_{day:%Y-%m-%d}.png"
+        _plot_sauce_session(bars[bars["session"] == day], log[log["session"] == day], sessions.loc[day, "open"],
+                            ticker, config, params, path)
+        paths.append(path)
+    return paths
+
+
+def _sauce_line(r):
+    """One text line per setup instance or trade for the table under the chart."""
+    band = f"{r['band']}/{r['side']}" if isinstance(r["band"], str) else f"{r['side']} {r['level_crossed']} cross"
+    start = {"A": "armed", "A_cont": "FAST outside", "B": "crossed"}[r["setup"]]
+    parts = [f"{r['setup']} {band} #{r['instance']}", f"{start} {_et(r['arm_time'])}"]
+    if r["setup"] == "A":
+        parts.append(f"parallel {_et(r['slow_parallel_time'])}")
+    if not pd.isna(r["invalidation_time"]):
+        parts.append(f"invalid {_et(r['invalidation_time'])} ({r['invalidation_reason']})")
+    if pd.isna(r["trade_no"]):
+        return " · ".join(parts + [f"no trade: {r['outcome']}"])
+    target = "no target" if pd.isna(r["target_level"]) else f"target {r['target_level']} {_px(r['target_price_at_entry'])}"
+    return " · ".join(parts + [f"{r['entry_type']} entry {_et(r['entry_time'])} @ {_px(r['entry_price'])}", target,
+                               f"exit {r['exit_reason']} {_et(r['exit_time'])} @ {_px(r['exit_price'])}",
+                               f"{r['pnl_usd']:+.2f} $ ({r['pnl_sigma']:+.2f}σ), {r['bars_held']} bars"])
+
+
+def _plot_sauce_session(day, rows, open_, ticker, config, params, path):
+    minute = pd.Timedelta(minutes=1)
+    x = lambda ts: (ts - open_) / minute  # noqa: E731 - minutes since the session open
+    mid = x(day["bar_start"]).to_numpy(float) + 1.0  # 2-minute candles; indicators drawn at their bar
+    k_target = 1.0 if params["allow_extended_target"] else params["target_level"]
+    shown = rows[(rows["setup"] == "A") | rows["trade_no"].notna()].sort_values(["arm_time", "trade_no"])
+    lines = [_sauce_line(r) for r in shown.head(9).to_dict("records")]
+    if len(shown) > 9:
+        lines.append(f"... {len(shown) - 9} more rows in setup_log.csv")
+
+    table = 0.2 * len(lines)  # inches of instance lines between the legend and the footer
+    height, top, bottom = 5.7 + table, 1.0, 1.35 + table
+    fig = plt.figure(figsize=(11, height), dpi=150, facecolor=SURFACE)
+    ax = fig.add_axes([0.7 / 11, bottom / height, (11 - 0.7 - 0.9) / 11, (height - top - bottom) / height])
+    ax.set_facecolor(SURFACE)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(colors=MUTED, labelcolor=INK_2, length=0, labelsize=7.5)
+    ax.grid(axis="y", color=GRID, lw=0.6, zorder=0)
+
+    for b, m in zip(day.itertuples(), mid):
+        ax.plot([m, m], [b.low, b.high], color=MUTED, lw=0.6, zorder=2)
+        ax.add_patch(plt.Rectangle((m - 0.65, min(b.open, b.close)), 1.3, max(abs(b.close - b.open), 1e-9),
+                                   facecolor=SURFACE if b.close >= b.open else MUTED, edgecolor=MUTED, lw=0.6,
+                                   zorder=2))
+    vwap, sigma = day["vwap"].to_numpy(float), day["sigma"].to_numpy(float)
+    labels = [(vwap[-1], "VWAP", INK)]
+    ax.plot(mid, vwap, color=INK, lw=1.2, zorder=3, label=f"VWAP ({params['vwap_lookback_sessions']} sessions)")
+    for k in BAND_SIGMAS:
+        target = np.isclose(k, k_target)
+        color, lw = (TARGET, 1.2) if target else ((INK_2, 1.0) if k == 2 else (BASELINE, 0.9))
+        for s in (1, -1):
+            level = vwap + s * k * sigma
+            ax.plot(mid, level, color=color, lw=lw, zorder=3,
+                    label=(f"±{k:g}σ bands (target)" if target else f"±{k:g}σ bands") if s > 0 else None)
+            labels.append((level[-1], f"{'U' if s > 0 else 'L'}{k:g}", INK_2))
+    ax.plot(mid, day["fast"], color=SERIES[0], lw=1.5, zorder=4, label="FAST EMA8")
+    ax.plot(mid, day["slow"], color=SERIES[1], lw=1.5, zorder=4, label="SLOW EMA48")
+    labels += [(day["fast"].iloc[-1], "FAST", INK), (day["slow"].iloc[-1], "SLOW", INK)]
+
+    pos = {t: n for n, t in enumerate(day["bar_end"])}
+    at = lambda ts, col: day[col].iloc[pos[ts]]  # noqa: E731 - indicator value at the bar ending at ts
+    ring = dict(mec=SURFACE, mew=1.2, zorder=6, ls="none")
+    seen = set()
+    for r in shown.to_dict("records"):
+        if r["setup"] == "A" and r["instance"] not in seen:
+            seen.add(r["instance"])
+            ax.plot(x(r["arm_time"]) - 1, at(r["arm_time"], "fast"), "o", ms=7, mfc=SURFACE, mec=INK, mew=1.2,
+                    zorder=6, ls="none", label="arm (FAST outside 2σ)" if "arm" not in seen else None)
+            seen.add("arm")
+            if not pd.isna(r["slow_parallel_time"]):
+                ax.plot(x(r["slow_parallel_time"]) - 1, at(r["slow_parallel_time"], "slow"), "D", ms=6, mfc=SURFACE,
+                        mec=INK, mew=1.2, zorder=6, ls="none",
+                        label="SLOW goes parallel" if "par" not in seen else None)
+                seen.add("par")
+            if r["invalidation_reason"] == "slow_crossed_band":
+                ax.plot(x(r["invalidation_time"]) - 1, at(r["invalidation_time"], "slow"), "X", ms=8, color=INK,
+                        **ring, label="invalidated (SLOW crossed)" if "inv" not in seen else None)
+                seen.add("inv")
+        if pd.isna(r["trade_no"]):
+            continue
+        long = r["side"] == "long"
+        ex, ey = x(r["entry_time"]), r["entry_price"]
+        xx, xy = x(r["exit_time"]), r["exit_price"]
+        ax.plot([ex, xx], [ey, xy], color=INK, lw=0.9, ls=(0, (1, 1.5)), zorder=5)
+        ax.plot(ex, ey, "^" if long else "v", ms=9, color=INK, **ring,
+                label=("entry (long)" if long else "entry (short)") if ("el" if long else "es") not in seen else None)
+        seen.add("el" if long else "es")
+        ax.plot(xx, xy, "o", ms=7, color=INK, **ring, label="exit" if "exit" not in seen else None)
+        seen.add("exit")
+        ax.annotate(f"{r['setup']} {r['exit_reason']} {r['pnl_sigma']:+.2f}σ", (xx, xy), xytext=(4, 6 if long else -6),
+                    textcoords="offset points", color=INK, fontsize=6.5, va="bottom" if long else "top")
+
+    right = x(day["bar_end"].iloc[-1])
+    ax.set_xlim(-3, right + 2)
+    lo = np.nanmin([day["low"].min(), np.nanmin(vwap - 2 * sigma)])
+    hi = np.nanmax([day["high"].max(), np.nanmax(vwap + 2 * sigma)])
+    pad = (hi - lo) * 0.04
+    ax.set_ylim(lo - pad, hi + pad)
+    gap = (hi - lo) * 0.035
+    placed = []
+    for level, text, color in sorted(v for v in labels if np.isfinite(v[0])):
+        y = max([level] + [q + gap for q in placed[-1:]])
+        placed.append(y)
+        ax.annotate(text, (right + 2, level), xytext=(right + 5, y), textcoords="data", color=color, fontsize=6.5,
+                    va="center", annotation_clip=False)
+    ticks = np.arange(0, right + 1, 30)
+    ax.set_xticks(ticks, [_et(open_ + t * minute) for t in ticks])
+    ax.set_xlabel("New York time (2-minute bars; each line is its value at that bar's close)", color=INK_2,
+                  fontsize=7.5)
+    fig.legend(loc="upper left", bbox_to_anchor=(0.7 / 11, (bottom - 0.42) / height), ncol=6, frameon=False,
+               fontsize=7, labelcolor=INK_2, handlelength=2.2)
+
+    fig.text(0.02, 1 - 0.15 / height, f"{ticker} · {open_.tz_convert(NY):%Y-%m-%d} · VWAP + Sauce", color=INK,
+             fontsize=11, fontweight="bold", va="top")
+    fig.text(0.02, 1 - 0.45 / height, textwrap.fill(
+        f"Configuration: {config}. Sessions are the first with a Setup A setup or a trade, by time, never by outcome. "
+        "Entries fill at the next bar's open; exits at a band touch, the next open or the close.", 175),
+        color=INK_2, fontsize=8, va="top", linespacing=1.4)
+    for n, text in enumerate(lines):
+        fig.text(0.02, (0.45 + table - 0.2 * n) / height, text, color=INK_2, fontsize=6.5, va="top",
+                 family="monospace")
+    fig.text(0.02, 0.1 / height, textwrap.fill(SAUCE_CAVEAT, 170), color=MUTED, fontsize=7, va="bottom")
     fig.savefig(path, facecolor=SURFACE)
     plt.close(fig)
