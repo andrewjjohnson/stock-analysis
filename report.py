@@ -12,6 +12,8 @@ import numpy as np  # noqa: E402
 
 import pandas as pd  # noqa: E402
 
+import volume_profile as vp  # noqa: E402
+from strategies.vwap_sauce import BAND_SIGMAS  # noqa: E402
 from outcomes import COST_BPS, EXCURSION_MINUTES, HORIZONS  # noqa: E402
 
 # Chart colors: categorical slots 1-2 (validated pair) plus neutral ink and chrome;
@@ -28,6 +30,8 @@ CAVEAT = ("Signal study, not P&L: the reference price is the completed trigger b
 BARRIER_CAVEAT = ("Idealized barrier comparison, not P&L: next-minute-open entry, fixed stop/target touches, no "
                   "compounding. 1 bp/side is an illustrative friction sensitivity, not calibrated costs; "
                   "no borrow costs, and short results do not establish borrow availability.")
+PROFILE_CAVEAT = (f"Profile = {vp.PROFILE_METHOD}: minute volume spread evenly over each minute's range, not traded "
+                  "volume at price. Relative volume and candle shape are not order flow.")
 
 
 def summarize(candidates):
@@ -139,6 +143,64 @@ def format_counts(summary):
             f"(opening incomplete {int(first['or_incomplete'])}, prior ATR unavailable {int(first['atr_unavailable'])})"
             f" -> qualifying openings {per_side('qualifying_openings')} (flat skipped "
             f"{int(first['flat_openings_skipped'])}) -> signals {per_side('n_candidates')}")
+    return "\n".join(lines)
+
+
+def format_setup_funnel(summary):
+    """auction_reclaim setup counts per configuration, segment and side (aggregates only)."""
+    lines = []
+    sides = summary[summary["pattern"] == "all"]
+    for (config, segment), g in sides.groupby(["config", "segment"], sort=False):
+        f = g.iloc[0]
+        lines.append(f"{config:<22}{segment:<11}{int(f['sessions'])} sessions -> {int(f['eligible_sessions'])} "
+                     f"eligible (no bars {int(f['no_bars'])}, previous-session profile unavailable "
+                     f"{int(f['profile_unavailable'])}, prior ATR unavailable {int(f['atr_unavailable'])})")
+        for r in g.to_dict("records"):
+            invalid = r["invalid_extreme"] + r["invalid_poc"] + r["invalid_close"]
+            lines.append(f"{'':<33}{r['side']:<6}excursions {r['excursions']} -> reclaims {r['reclaims']} (POC first "
+                         f"{r['reclaim_poc_first']}, expired {r['reclaim_expired']}) -> no LVN {r['lvn_no_node']}, "
+                         f"invalidated {invalid} (extreme {r['invalid_extreme']}, POC {r['invalid_poc']}, close "
+                         f"{r['invalid_close']}), retest expired {r['retest_expired']} -> signals "
+                         f"{r['n_candidates']}; also reset: missing bar {r['missing_bar_reset']}, signal window "
+                         f"ended {r['window_closed']}")
+    return "\n".join(lines)
+
+
+def stability(candidates, barriers=False):
+    """Counts and mean outcomes per configuration, segment, side and period (each year, then each month).
+
+    Periods without candidates are absent. Means with no available values are NaN.
+    """
+    stats = ["n_candidates", "n_30m", "mean_30m_pct", "frac_pos_30m"]
+    stats += ["n_resolved_0bp", "mean_r_0bp"] if barriers else []
+    columns = ["config", "segment", "side", "period", *stats]
+    if candidates.empty:
+        return pd.DataFrame(columns=columns)
+    frames = []
+    for period in (candidates["session"].dt.strftime("%Y"), candidates["session"].dt.strftime("%Y-%m")):
+        g = candidates.assign(period=period).groupby(["config", "segment", "side", "period"], sort=True)
+        ret = g["fwd_ret_30m_pct"]
+        f = pd.DataFrame({"n_candidates": g.size(), "n_30m": ret.count(), "mean_30m_pct": ret.mean(),
+                          "frac_pos_30m": ret.apply(lambda v: (v.dropna() > 0).mean() if v.notna().any() else np.nan)})
+        if barriers:
+            f["n_resolved_0bp"], f["mean_r_0bp"] = g["barrier_r_0bp"].count(), g["barrier_r_0bp"].mean()
+        frames.append(f.reset_index())
+    return pd.concat(frames, ignore_index=True)[columns]
+
+
+def format_stability(table):
+    """Compact per-period lines: years first, then months."""
+    if table.empty:
+        return "(no candidates)"
+    barriers = "mean_r_0bp" in table
+    lines = [f"{'segment':<11}{'period':<9}{'side':<7}{'cands':>6}{'30m % (n)':>16}{'>0 @30m':>9}"
+             + (f"{'R@0bp mean (n)':>18}" if barriers else "")]
+    for r in table.to_dict("records"):
+        line = (f"{r['segment']:<11}{r['period']:<9}{r['side']:<7}{r['n_candidates']:>6}"
+                f"{_fmt(r['mean_30m_pct'], r['n_30m']):>16}{_fmt(r['frac_pos_30m'], sign=False):>9}")
+        if barriers:
+            line += f"{_fmt(r['mean_r_0bp'], r['n_resolved_0bp']):>18}"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -396,5 +458,300 @@ def _plot_candidate(day, c, ticker, path):
             fig.text(left + 0.115, y, v, color=INK_2, fontsize=7, va="top")
     fig.text(0.02, 0.1 / height, textwrap.fill(BARRIER_CAVEAT if "entry_status" in c else CAVEAT, 130),
              color=MUTED, fontsize=7, va="bottom")
+    fig.savefig(path, facecolor=SURFACE)
+    plt.close(fig)
+
+
+def plot_auction_candidates(out_dir, candidates, bars, minutes, ticker, limit=6):
+    """auction_reclaim inspection charts for the first `limit` candidates by signal time (never chosen by outcome)."""
+    out = Path(out_dir)
+    paths = []
+    for n, c in enumerate(candidates.sort_values("signal_time", kind="stable").head(limit).to_dict("records"), 1):
+        path = out / f"candidate_{n}_{c['session']:%Y-%m-%d}_{c['side']}.png"
+        _plot_auction_candidate(bars[bars["session"] == c["session"]], minutes[minutes["session"] == c["session"]],
+                                minutes[minutes["session"] == c["prev_session"]], c, ticker, path)
+        paths.append(path)
+    return paths
+
+
+def _plot_auction_candidate(day, day_minutes, prev_minutes, c, ticker, path):
+    """5-minute candles beside the frozen previous-session profile, with value levels, VWAP and the setup bars."""
+    minute = pd.Timedelta(minutes=1)
+    open_ = day["session_open"].iloc[0]
+    x = lambda ts: (ts - open_) / minute  # noqa: E731 - minutes since the session open
+    has_exit = "exit_time" in c and not pd.isna(c["exit_time"])
+    right = min(x(day["session_close"].iloc[0]),
+                max(150.0, x(c["signal_time"]) + 30, x(c["exit_time"]) + 15 if has_exit else 0.0))
+    shown = day[(day["bar_start"] - open_) / minute < right]
+
+    height, top, bottom = 7.2, 1.05, 2.5
+    fig = plt.figure(figsize=(8, height), dpi=150, facecolor=SURFACE)
+    span = (height - top - bottom) / height
+    pax = fig.add_axes([0.6 / 8, bottom / height, 0.75 / 8, span])
+    ax = fig.add_axes([1.45 / 8, bottom / height, (8 - 1.45 - 1.55) / 8, span], sharey=pax)
+    for a in (ax, pax):
+        a.set_facecolor(SURFACE)
+        for spine in a.spines.values():
+            spine.set_visible(False)
+        a.tick_params(colors=MUTED, labelcolor=INK_2, length=0, labelsize=7)
+    ax.tick_params(labelleft=False)
+    ax.grid(axis="y", color=GRID, lw=0.6, zorder=0)
+
+    # The profile is rebuilt here from the same previous-session minutes and bin count as the frozen levels.
+    profile = vp.bar_profile(prev_minutes["low"], prev_minutes["high"], prev_minutes["volume"], int(c["profile_bins"]))
+    if profile is not None:
+        edges, volume = profile
+        centers = (edges[:-1] + edges[1:]) / 2
+        colors = np.where((centers > c["val"]) & (centers < c["vah"]), MUTED, BASELINE).astype(object)
+        colors[int(np.argmax(volume))] = INK
+        pax.barh(centers, volume, height=np.diff(edges) * 0.85, color=list(colors), zorder=3)
+    pax.invert_xaxis()
+    pax.set_xticks([])
+    pax.set_title(f"previous session\nbar-approx. profile\n{int(c['profile_bins'])} bins; dark = value area",
+                  color=INK_2, fontsize=6.5, loc="right")
+
+    sig_end = x(c["signal_time"])
+    for when, tint in ((c["excursion_end"], OPENING_TINT), (c["reclaim_end"], OPENING_TINT),
+                       (c["signal_time"], SIGNAL_TINT)):
+        ax.axvspan(x(when) - 5, x(when), color=tint, lw=0, zorder=1)
+    for level, style, color in ((c["val"], (0, (1, 2)), MUTED), (c["vah"], (0, (1, 2)), MUTED),
+                                (c["poc"], (0, (4, 2)), INK_2)):
+        ax.plot([0, right], [level, level], color=color, lw=0.9, ls=style, zorder=2)
+    rec_end = x(c["reclaim_end"])
+    ax.add_patch(plt.Rectangle((rec_end, c["location_lo"]), sig_end - rec_end, c["location_hi"] - c["location_lo"],
+                               facecolor="none", edgecolor=SERIES[0], lw=1.0, ls=(0, (3, 2)), zorder=5))
+    vwap = day_minutes[(day_minutes["ts"] - open_) / minute < right]
+    ax.plot(x(vwap["ts"]) + 1, vwap["session_vwap"], color=INK, lw=0.9, ls=(0, (5, 1.5, 1, 1.5)), zorder=4)
+
+    for b in shown.itertuples():
+        mid = x(b.bar_start) + 2.5
+        is_signal = b.bar_end == c["signal_time"]
+        edge = SERIES[0] if is_signal else INK_2
+        ax.plot([mid, mid], [b.low, b.high], color=edge, lw=1.1 if is_signal else 0.7, zorder=3)
+        ax.add_patch(plt.Rectangle((mid - 1.7, min(b.open, b.close)), 3.4, max(abs(b.close - b.open), 1e-9),
+                                   facecolor=SURFACE if b.close >= b.open else edge, edgecolor=edge,
+                                   lw=1.1 if is_signal else 0.7, zorder=4))
+
+    labels = [(c["val"], f"VAL {_px(c['val'])}", INK_2), (c["poc"], f"POC {_px(c['poc'])}", INK_2),
+              (c["vah"], f"VAH {_px(c['vah'])}", INK_2), (c["vwap"], f"VWAP {_px(c['vwap'])}", INK_2)]
+    if "entry_price" in c and not pd.isna(c["entry_price"]):
+        end = x(c["exit_time"]) if has_exit else right
+        for level, color, style, name in ((c["entry_price"], INK, (0, (1, 1.5)), "entry"),
+                                          (c["frozen_stop"], SERIES[1], (0, (4, 2)), "stop"),
+                                          (c["frozen_target"], TARGET, (0, (4, 2)), "target")):
+            ax.plot([sig_end, end], [level, level], color=color, lw=1.4, ls=style, zorder=5)
+            labels.append((level, f"{name} {_px(level)}", INK))
+        if has_exit:
+            ax.plot(x(c["exit_time"]), c["exit_price"], "o", ms=6, color=INK, mec=SURFACE, mew=1.5, zorder=6)
+    else:
+        ax.plot([sig_end, right], [c["frozen_stop"]] * 2, color=SERIES[1], lw=1.4, ls=(0, (4, 2)), zorder=5)
+        labels.append((c["frozen_stop"], f"stop {_px(c['frozen_stop'])}", INK))
+
+    ax.set_xlim(-3, right + 2)
+    day_lo, day_hi = shown["low"].min(), shown["high"].max()
+    lo = min(day_lo, c["val"], c["frozen_stop"])
+    hi = max(day_hi, c["vah"], c["frozen_stop"])
+    pad = (hi - lo) * 0.08
+    ax.set_ylim(lo - pad, hi + 3 * pad)  # headroom for the setup labels
+    gap = (hi - lo + 4 * pad) * 0.045
+    placed = []
+    for level, text, color in sorted(labels):
+        y = max([level] + [p + gap for p in placed[-1:]])
+        placed.append(y)
+        ax.annotate(text, (right + 2, level), xytext=(right + 6, y), textcoords="data", color=color, fontsize=7,
+                    va="center", annotation_clip=False,
+                    arrowprops=dict(arrowstyle="-", color=GRID, lw=0.6) if abs(y - level) > gap / 4 else None)
+    top_y = hi + 3 * pad
+    for when, name in ((c["excursion_end"], "excursion"), (c["reclaim_end"], "reclaim"), (c["signal_time"], "signal")):
+        ax.annotate(name, (x(when) - 2.5, top_y), xytext=(0, -2), textcoords="offset points", color=INK_2, fontsize=6.5,
+                    ha="center", va="top", rotation=90)
+    ticks = np.arange(0, right + 1, 30)
+    ax.set_xticks(ticks, [_et(open_ + t * minute) for t in ticks])
+    ax.set_xlabel("New York time (5-minute bars; dash-dot = session VWAP; dashed box = retest location)",
+                  color=INK_2, fontsize=7)
+
+    title = f"{ticker} · {c['session']:%Y-%m-%d} · {c['side']} · {c['config']}"
+    title += "" if c["location"] in c["config"] else f" · {c['location']}"
+    fig.text(0.02, 1 - 0.15 / height, title, color=INK, fontsize=11, fontweight="bold", va="top")
+    fig.text(0.02, 1 - 0.45 / height, "First candidates by time, not by outcome. Gray: excursion and reclaim bars; "
+             "blue: the signal bar, known when it completes.", color=INK_2, fontsize=8, va="top")
+
+    columns = [("Frozen levels", [
+        ("VAL / VAH", f"{_px(c['val'])} / {_px(c['vah'])}"),
+        ("POC", _px(c["poc"])),
+        ("prior ATR14 A", _px(c["prev_atr_14"])),
+        ("b / d", f"{c['buffer_b']:.3f} / {c['retest_tol_d']:.3f}"),
+        ("profile from", f"{c['prev_session']:%Y-%m-%d}"),
+    ]), ("Setup", [
+        ("excursion", f"{_et(c['excursion_end'])} close {_px(c['excursion_close'])}"),
+        ("extreme", _px(c["excursion_extreme"])),
+        ("reclaim", f"{_et(c['reclaim_end'])} close {_px(c['reclaim_close'])}"),
+        ("location", f"{_px(c['location_lo'])} - {_px(c['location_hi'])}"),
+    ]), ("Signal bar", [
+        ("known at", f"{_et(c['signal_time'])} close {_px(c['ref_close'])}"),
+        ("rel. volume", f"{c['rvol']:.2f}"),
+        ("VWAP (15m chg)", f"{_px(c['vwap'])} ({c['vwap_change_15m']:+.3f})"),
+        ("stop / target", f"{_px(c['frozen_stop'])} / {_px(c['frozen_target'])}"),
+        ("reward/risk", f"{c['signal_reward_risk']:.2f}"),
+    ])]
+    if "entry_status" in c:
+        r0, r1 = (c[f"barrier_r_{b}bp"] for b in COST_BPS)
+        columns.append(("Barrier comparison", [
+            ("entry", f"{c['entry_status']} {_et(c['entry_time'])} {_px(c['entry_price'])}"),
+            ("exit", f"{c['exit_reason'] or '—'} {_et(c['exit_time'])} {_px(c['exit_price'])}"),
+            ("ambiguous", "yes (stop first)" if c["ambiguous"] else "no"),
+            (f"R @{COST_BPS[0]} / {COST_BPS[1]} bp", "—" if pd.isna(r0) else f"{r0:+.2f} / {r1:+.2f}"),
+        ]))
+    else:
+        columns.append(("Outcome", [("30m directional", "—" if pd.isna(c["fwd_ret_30m_pct"]) else
+                                     f"{c['fwd_ret_30m_pct']:+.3f}%")]))
+    for col, (heading, rows) in enumerate(columns):
+        left = 0.02 + col * 0.245
+        fig.text(left, 1.95 / height, heading, color=INK, fontsize=8, fontweight="bold", va="top")
+        for i, (k, v) in enumerate(rows):
+            y = (1.95 - 0.23 * (i + 1)) / height
+            fig.text(left, y, k, color=MUTED, fontsize=6.5, va="top")
+            fig.text(left + 0.105, y, v, color=INK_2, fontsize=6.5, va="top")
+    footer = f"{PROFILE_CAVEAT} {BARRIER_CAVEAT if 'entry_status' in c else CAVEAT}"
+    fig.text(0.02, 0.1 / height, textwrap.fill(footer, 130), color=MUTED, fontsize=7, va="bottom")
+    fig.savefig(path, facecolor=SURFACE)
+    plt.close(fig)
+
+
+SAUCE_CAVEAT = ("Gross simulated trades on the underlying, one share: next-bar-open entries, idealized touch fills on "
+                "2-minute bars, no costs, slippage or options pricing. Not options P&L. In-sample / exploratory.")
+
+
+def plot_sauce_sessions(out_dir, log, bars, sessions, ticker, config, params, dates):
+    """VWAP + Sauce overlay per session: candles, VWAP, six bands, FAST, SLOW and setup markers."""
+    paths = []
+    for day in dates:
+        path = Path(out_dir) / f"session_{day:%Y-%m-%d}.png"
+        _plot_sauce_session(bars[bars["session"] == day], log[log["session"] == day], sessions.loc[day, "open"],
+                            ticker, config, params, path)
+        paths.append(path)
+    return paths
+
+
+def _sauce_line(r):
+    """One text line per setup instance or trade for the table under the chart."""
+    band = f"{r['band']}/{r['side']}" if isinstance(r["band"], str) else f"{r['side']} {r['level_crossed']} cross"
+    start = {"A": "armed", "A_cont": "FAST outside", "B": "crossed"}[r["setup"]]
+    parts = [f"{r['setup']} {band} #{r['instance']}", f"{start} {_et(r['arm_time'])}"]
+    if r["setup"] == "A":
+        parts.append(f"parallel {_et(r['slow_parallel_time'])}")
+    if not pd.isna(r["invalidation_time"]):
+        parts.append(f"invalid {_et(r['invalidation_time'])} ({r['invalidation_reason']})")
+    if pd.isna(r["trade_no"]):
+        return " · ".join(parts + [f"no trade: {r['outcome']}"])
+    target = "no target" if pd.isna(r["target_level"]) else f"target {r['target_level']} {_px(r['target_price_at_entry'])}"
+    return " · ".join(parts + [f"{r['entry_type']} entry {_et(r['entry_time'])} @ {_px(r['entry_price'])}", target,
+                               f"exit {r['exit_reason']} {_et(r['exit_time'])} @ {_px(r['exit_price'])}",
+                               f"{r['pnl_usd']:+.2f} $ ({r['pnl_sigma']:+.2f}σ), {r['bars_held']} bars"])
+
+
+def _plot_sauce_session(day, rows, open_, ticker, config, params, path):
+    minute = pd.Timedelta(minutes=1)
+    x = lambda ts: (ts - open_) / minute  # noqa: E731 - minutes since the session open
+    mid = x(day["bar_start"]).to_numpy(float) + 1.0  # 2-minute candles; indicators drawn at their bar
+    k_target = 1.0 if params["allow_extended_target"] else params["target_level"]
+    shown = rows[(rows["setup"] == "A") | rows["trade_no"].notna()].sort_values(["arm_time", "trade_no"])
+    lines = [_sauce_line(r) for r in shown.head(9).to_dict("records")]
+    if len(shown) > 9:
+        lines.append(f"... {len(shown) - 9} more rows in setup_log.csv")
+
+    table = 0.2 * len(lines)  # inches of instance lines between the legend and the footer
+    height, top, bottom = 5.7 + table, 1.0, 1.35 + table
+    fig = plt.figure(figsize=(11, height), dpi=150, facecolor=SURFACE)
+    ax = fig.add_axes([0.7 / 11, bottom / height, (11 - 0.7 - 0.9) / 11, (height - top - bottom) / height])
+    ax.set_facecolor(SURFACE)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(colors=MUTED, labelcolor=INK_2, length=0, labelsize=7.5)
+    ax.grid(axis="y", color=GRID, lw=0.6, zorder=0)
+
+    for b, m in zip(day.itertuples(), mid):
+        ax.plot([m, m], [b.low, b.high], color=MUTED, lw=0.6, zorder=2)
+        ax.add_patch(plt.Rectangle((m - 0.65, min(b.open, b.close)), 1.3, max(abs(b.close - b.open), 1e-9),
+                                   facecolor=SURFACE if b.close >= b.open else MUTED, edgecolor=MUTED, lw=0.6,
+                                   zorder=2))
+    vwap, sigma = day["vwap"].to_numpy(float), day["sigma"].to_numpy(float)
+    labels = [(vwap[-1], "VWAP", INK)]
+    ax.plot(mid, vwap, color=INK, lw=1.2, zorder=3, label=f"VWAP ({params['vwap_lookback_sessions']} sessions)")
+    for k in BAND_SIGMAS:
+        target = np.isclose(k, k_target)
+        color, lw = (TARGET, 1.2) if target else ((INK_2, 1.0) if k == 2 else (BASELINE, 0.9))
+        for s in (1, -1):
+            level = vwap + s * k * sigma
+            ax.plot(mid, level, color=color, lw=lw, zorder=3,
+                    label=(f"±{k:g}σ bands (target)" if target else f"±{k:g}σ bands") if s > 0 else None)
+            labels.append((level[-1], f"{'U' if s > 0 else 'L'}{k:g}", INK_2))
+    ax.plot(mid, day["fast"], color=SERIES[0], lw=1.5, zorder=4, label="FAST EMA8")
+    ax.plot(mid, day["slow"], color=SERIES[1], lw=1.5, zorder=4, label="SLOW EMA48")
+    labels += [(day["fast"].iloc[-1], "FAST", INK), (day["slow"].iloc[-1], "SLOW", INK)]
+
+    pos = {t: n for n, t in enumerate(day["bar_end"])}
+    at = lambda ts, col: day[col].iloc[pos[ts]]  # noqa: E731 - indicator value at the bar ending at ts
+    ring = dict(mec=SURFACE, mew=1.2, zorder=6, ls="none")
+    seen = set()
+    for r in shown.to_dict("records"):
+        if r["setup"] == "A" and r["instance"] not in seen:
+            seen.add(r["instance"])
+            ax.plot(x(r["arm_time"]) - 1, at(r["arm_time"], "fast"), "o", ms=7, mfc=SURFACE, mec=INK, mew=1.2,
+                    zorder=6, ls="none", label="arm (FAST outside 2σ)" if "arm" not in seen else None)
+            seen.add("arm")
+            if not pd.isna(r["slow_parallel_time"]):
+                ax.plot(x(r["slow_parallel_time"]) - 1, at(r["slow_parallel_time"], "slow"), "D", ms=6, mfc=SURFACE,
+                        mec=INK, mew=1.2, zorder=6, ls="none",
+                        label="SLOW goes parallel" if "par" not in seen else None)
+                seen.add("par")
+            if r["invalidation_reason"] == "slow_crossed_band":
+                ax.plot(x(r["invalidation_time"]) - 1, at(r["invalidation_time"], "slow"), "X", ms=8, color=INK,
+                        **ring, label="invalidated (SLOW crossed)" if "inv" not in seen else None)
+                seen.add("inv")
+        if pd.isna(r["trade_no"]):
+            continue
+        long = r["side"] == "long"
+        ex, ey = x(r["entry_time"]), r["entry_price"]
+        xx, xy = x(r["exit_time"]), r["exit_price"]
+        ax.plot([ex, xx], [ey, xy], color=INK, lw=0.9, ls=(0, (1, 1.5)), zorder=5)
+        ax.plot(ex, ey, "^" if long else "v", ms=9, color=INK, **ring,
+                label=("entry (long)" if long else "entry (short)") if ("el" if long else "es") not in seen else None)
+        seen.add("el" if long else "es")
+        ax.plot(xx, xy, "o", ms=7, color=INK, **ring, label="exit" if "exit" not in seen else None)
+        seen.add("exit")
+        ax.annotate(f"{r['setup']} {r['exit_reason']} {r['pnl_sigma']:+.2f}σ", (xx, xy), xytext=(4, 6 if long else -6),
+                    textcoords="offset points", color=INK, fontsize=6.5, va="bottom" if long else "top")
+
+    right = x(day["bar_end"].iloc[-1])
+    ax.set_xlim(-3, right + 2)
+    lo = np.nanmin([day["low"].min(), np.nanmin(vwap - 2 * sigma)])
+    hi = np.nanmax([day["high"].max(), np.nanmax(vwap + 2 * sigma)])
+    pad = (hi - lo) * 0.04
+    ax.set_ylim(lo - pad, hi + pad)
+    gap = (hi - lo) * 0.035
+    placed = []
+    for level, text, color in sorted(v for v in labels if np.isfinite(v[0])):
+        y = max([level] + [q + gap for q in placed[-1:]])
+        placed.append(y)
+        ax.annotate(text, (right + 2, level), xytext=(right + 5, y), textcoords="data", color=color, fontsize=6.5,
+                    va="center", annotation_clip=False)
+    ticks = np.arange(0, right + 1, 30)
+    ax.set_xticks(ticks, [_et(open_ + t * minute) for t in ticks])
+    ax.set_xlabel("New York time (2-minute bars; each line is its value at that bar's close)", color=INK_2,
+                  fontsize=7.5)
+    fig.legend(loc="upper left", bbox_to_anchor=(0.7 / 11, (bottom - 0.42) / height), ncol=6, frameon=False,
+               fontsize=7, labelcolor=INK_2, handlelength=2.2)
+
+    fig.text(0.02, 1 - 0.15 / height, f"{ticker} · {open_.tz_convert(NY):%Y-%m-%d} · VWAP + Sauce", color=INK,
+             fontsize=11, fontweight="bold", va="top")
+    fig.text(0.02, 1 - 0.45 / height, textwrap.fill(
+        f"Configuration: {config}. Sessions are the first with a Setup A setup or a trade, by time, never by outcome. "
+        "Entries fill at the next bar's open; exits at a band touch, the next open or the close.", 175),
+        color=INK_2, fontsize=8, va="top", linespacing=1.4)
+    for n, text in enumerate(lines):
+        fig.text(0.02, (0.45 + table - 0.2 * n) / height, text, color=INK_2, fontsize=6.5, va="top",
+                 family="monospace")
+    fig.text(0.02, 0.1 / height, textwrap.fill(SAUCE_CAVEAT, 170), color=MUTED, fontsize=7, va="bottom")
     fig.savefig(path, facecolor=SURFACE)
     plt.close(fig)

@@ -24,7 +24,9 @@ Boundaries from the original brief:
 - **Deliberately left out of v1:** portfolio accounting, order execution, commissions,
   target/stop simulation, ML training, walk-forward orchestration and equity curves. If a
   task needs one, keep it as small as the rest, and never present signal-study returns as
-  P&L.
+  P&L. The one trade simulation is `sauce.py` (VWAP + Sauce): next-open fills, band targets,
+  stops and one position at a time. Its results are gross, per share of the underlying, and
+  labeled that way, never as options P&L.
 - **Prices** are Massive split-adjusted (`download.ADJUSTED`) but not dividend-adjusted,
   so returns are price returns, never total returns.
 - **Speed claims:** the CLI prints measured per-stage timings. Don't claim a speedup
@@ -37,13 +39,14 @@ no linter or formatter config.
 
 ```bash
 uv sync                          # install/update dependencies, including pytest
-uv run pytest -q                 # all tests: about 1 s, no API key, no network
+uv run pytest -q                 # all tests: about 7 s, no API key, no network
 uv run pytest tests/test_outcomes.py::test_split_selects_on_earlier_segment_and_outcomes_stay_inside_segments -q
 uv run pytest -k lookahead -q    # select by keyword
-uv run python demo.py            # offline end-to-end run on SYNTHETIC data -> output/demo/{single,sweep,split}
+uv run python demo.py            # offline end-to-end run on SYNTHETIC data -> output/demo/<run>/
 uv run python run.py --help
 uv run python run.py --start 2025-04-01 --end 2026-03-31 --out output/x                              # needs MASSIVE_API_KEY
 uv run python run.py --start 2025-04-01 --end 2026-03-31 --fast 5 9 12 --slow 20 21 30 --split-date 2025-10-01 --out output/y
+uv run python sauce.py --ticker SPY --start 2022-04-01 --end 2024-12-31 --compare --out output/z   # cached SPY: no key needed
 ```
 
 - **Checking a change:** `demo.py` is the quickest end-to-end check without credentials,
@@ -87,6 +90,24 @@ Data flow, one ticker per run:
   candidate column.
 - Strategies see feature data only: `bars` never contains outcomes.
 
+**VWAP + Sauce** is a separate trade simulation with its own CLI, because it needs entries,
+exits and one position at a time rather than candidates and forward outcomes:
+1. `sauce.main` loads sessions and minutes the same way as `run.main`.
+2. `sauce.run_sauce`, which does no file I/O, calls `features.build_features` with 2-minute
+   bars and EMA 8/48. `vwap_sauce.add_indicators` then adds the anchored VWAP and sigma,
+   once per distinct `vwap_lookback_sessions`.
+3. `vwap_sauce.simulate(bars, **params)` runs one per-bar state machine over the study bars
+   and returns the setup log: one row per setup instance and trade. `vwap_sauce.summarize`
+   and `vwap_sauce.monthly` compute the statistics from that log.
+4. `sauce.execute` writes `setup_log.csv`, `summary.csv`, `monthly.csv`, `settings.json`
+   and `session_<date>.png` (`report.plot_sauce_sessions`). With `--random-baseline N`,
+   `sauce.entry_baseline` also compares Setup A's entries with matched random ones under
+   identical fixed-bracket exits (`outcomes.barrier_exits`) and writes `entry_baseline.csv`.
+
+Every rule the source brief marked as an assumption is a key in `vwap_sauce.DEFAULTS`, and
+a CLI flag. The choices the brief leaves open are listed in `vwap_sauce.IMPLEMENTATION`.
+Don't add filters beyond those two lists.
+
 ## Invariants: each has a guarding test
 
 | Rule | Test |
@@ -95,6 +116,9 @@ Data flow, one ticker per run:
 | **No lookahead:** Massive timestamps are bar starts, and a bar's close/high/low are usable only at `bar_end`. Daily features come from the previous session. Intraday EMAs are causal and run continuously across sessions, with no morning reset. | `test_future_prices_cannot_change_earlier_features_or_triggers` |
 | **Outcomes:** looked up by elapsed minutes from T = `bar_end`. A value exists only if every minute in [T, T+h) is present and T+h is no later than the session close and the segment end. Otherwise it is NaN and the candidate is kept. MFE ≥ 0 ≥ MAE, and the trigger bar's own minutes are excluded. | `test_missing_minutes_close_and_segment_end_give_nan_but_keep_rows`, `test_known_trigger_timestamp_and_outcomes_only_for_triggers` |
 | **Split:** rank only on earlier-segment summaries; a config qualifies with ≥ `--min-labeled` available outcomes at `--select-horizon`. Only the pick is evaluated later, nothing is picked if none qualifies, and without a split everything is labeled exploratory/in-sample. | `test_split_selects_on_earlier_segment_and_outcomes_stay_inside_segments` |
+| **Sauce, no lookahead:** VWAP and sigma at a bar use bars through its close only, and EMAs are causal. Changing later minutes leaves earlier indicators and trades unchanged. Targets and price stops fill against the level known at the previous close. | `test_future_prices_cannot_change_earlier_indicators_or_trades`, `test_target_level_is_the_one_known_at_the_previous_close`, `test_anchored_vwap_and_sigma_match_a_direct_computation` |
+| **Sauce fills and sessions:** a decision made at a close fills at the next bar's open in the same session. Setups end with their session, and a position carries overnight only with `--no-time-stop`. There is one position at a time. | `test_setup_a_long_arms_goes_parallel_enters_next_open_and_exits_at_the_moving_target`, `test_sessions_are_independent_unless_the_time_stop_is_off`, `test_one_position_at_a_time_blocks_other_entries` |
+| **Sauce symmetry:** the upper band is the exact mirror of the lower band. | `test_upper_band_is_the_exact_mirror_of_the_lower_band` |
 | **Data:** an identical request reads the cache without creating a Massive client. Every page is fetched. A fresh download that doesn't reach the final session's last regular-hours minute raises an error and is not cached; checking only the date would accept a download cut off mid-session or holding only pre-market bars. Synthetic data is never a fallback for a failed request. | `tests/test_download.py` |
 
 Missing minutes are never filled. Gaps are dropped and reported (in the coverage lines and
@@ -137,7 +161,10 @@ Missing minutes are never filled. Gaps are dropped and reported (in the coverage
   illiquid tickers get many unavailable outcomes under the full-window rule.
 - **Calendar range:** `exchange_calendars` defaults to about 20 years of history, so
   `trading_sessions` builds the calendar with an explicit start that covers the warm-up.
-- **Today's session** is skipped in `run.main`, because its data may be incomplete.
+- **Today's session** is skipped in `run.main` and `sauce.main`, because its data may be incomplete.
+- **2-minute coverage:** `sauce.py` defaults to `--min-coverage 0.5`, where one traded minute
+  makes a bar, as on a chart. At 0.8, every 2-minute bar with a quiet minute would be
+  dropped.
 - **Charts:** `report.py` forces matplotlib's Agg backend.
 
 ## Workflow
