@@ -413,6 +413,527 @@ minutes for 2022-04-01 to 2024-12-31, about 15 setups arm per month and 4.5 to 5
 trade with the defaults. The run above prints this frequency every time. Max drawdown is
 over one share per trade, in trade order: a check on the sequence, not portfolio accounting.
 
+## Alert check (`alerts.py`)
+
+Measures how often a log of posted SPY calls was right, using independent Massive minutes. The
+log is a CSV with one row per call (`date, weekday, strategy, time_et, direction, action,
+ticker, ref_price, score, flag, alerts_posted, notes, source_line`): `intraday` calls at 10:00
+ET and `overnight` calls at 15:55 ET, each BULLISH, BEARISH or NEUTRAL. Keep the log in the
+git-ignored `data-files/`. It is a signal study of the underlying, not option P&L.
+
+```bash
+uv run --env-file .env python alerts.py --csv data-files/<log>.csv --out output/alerts
+```
+
+- **Checks:** row consistency (weekday, action, score, ticker, duplicates), alert times
+  against the schedule and the XNYS session, missing rows (reported, never filled), and
+  `ref_price` against nearby minute bars, flagging gaps over 0.1%.
+- **Reference:** the Massive price known at the alert time, the close of the minute bar
+  ending then. The CSV's `ref_price` is a sensitivity check.
+- **Horizons:** intraday to the same close (primary) and the next close; overnight to the
+  next open (primary: the open of its first regular minute), 10:00 the next session and the
+  next close. Every regular minute from the reference bar to the end point must exist,
+  otherwise the outcome is unavailable. One that ends in today's session or later is pending.
+  Both are kept in the table and left out of the statistics.
+- **Statistics:** hit rate (signed return > 0) with a Wilson interval next to the base rate
+  (SPY up over the same windows, which an always-bullish rule scores), the paired difference
+  with a bootstrap interval over dates, 10,000 shuffles of the calls across dates keeping the
+  bullish/bearish counts, and a coin-flip binomial test. Exploratory sections cover the other
+  horizons, premium-selling distances, overnight move sizes, ex-dividend windows (dates from
+  Massive's dividends endpoint), NEUTRAL move sizes, the overnight score, naive momentum rules,
+  halves and months, flagged rows and the `ref_price` reference.
+- **Output:** `alerts_with_outcomes.csv`, `summary.csv` (one statistic per row),
+  `report.md`, `hit_rates.png` and `overnight_score.png`.
+
+## Alert spreads (`alert_spreads.py`)
+
+Trades the intraday alerts from the same log as same-day $1 SPY vertical spreads, on Massive
+option minute bars (an options data plan is required). BULLISH sells the put at the first
+strike at or above SPY at 10:00 ET and buys the put $1 below; BEARISH sells the call at the
+first strike at or below and buys the call $1 above. The user's rule (`--take-profit`, `--stop`)
+defaults to a take profit at 80% of the credit with no stop, otherwise an exit at 15:30 ET.
+`--rule-since` is the date that rule was adopted: the report keeps the trades before it (which
+chose the rule, so they flatter it) apart from the trades since, which are the real test.
+
+```bash
+uv run --env-file .env python alert_spreads.py --csv data-files/<log>.csv --out output/alert_spreads
+```
+
+- **Baselines with identical exits, on the same days:** the bull put spread every day, the
+  bear call spread every day, and the alerts' calls shuffled across the days (10,000 times).
+- **Grid:** take profit (10–90% of the credit, or none) x stop (10–90% of the max loss, or
+  none), all with the 15:30 exit. Exploratory; every cell is reported.
+- **Context** (`--context`, default on): both directions on every session the data plan
+  covers, with no alerts, to show what the structure and exits do on their own.
+- **Fills:** the plan has no bid/ask quotes, so the spread trades only in minutes where both
+  legs traded. Entry and the time exit use the opens of the first such minute (within 5
+  minutes); take profits and stops use minute closes. Costs come from `--slippage` ($/share
+  per leg per fill) and `--commission` ($/contract per leg per fill), both 0 by default
+  (a commission-free broker; replaying actual fills at traded prices matched them within
+  about $1 a trade). The user's rule is also shown with +$0.01 and +$0.03 slippage, which
+  decide the sign of the result. Early assignment is ignored.
+- **Consistency:** every grid cell gets a consistency score (average trade ÷ its standard
+  error), win rate, profit factor, worst trade, drawdown and profitable months, scored with
+  the base costs and with +$0.01 slippage. A month-by-month check re-picks the most
+  consistent rule without each month and trades it in that month, to show whether choosing
+  the best cell works on data it didn't see.
+- **Strike placement:** the same $1 spread moved −3 to +3 dollars (+ = deeper in the money:
+  more credit, smaller max loss, needs the move). Each placement is run under the 50% and 80%
+  take profits on the alert days (with shuffled calls and wider slippage) and, with context,
+  every session without alerts. Placements deeper in the money are priced from their
+  out-of-the-money twins by put-call parity ($1 minus the other right's spread on the same
+  strikes), because thin in-the-money prints showed profits in both directions without any
+  alerts; the own-print result is shown beside it. Days without usable prices at a placement
+  are counted, with what the offset-0 spread made on them. `--no-offsets` skips it (the first
+  run downloads about 12 more contracts per session).
+- **Breakeven stop:** the user's rule and the 50%/80% rules are also run with a stop at
+  breakeven that arms once profit reaches 40% of the credit, on the alert days and every
+  context session, trade by trade against the same spreads without it.
+- **Scaling and drawdowns:** the user's rule resampled in runs of 5 consecutive trades
+  (a block bootstrap, so losing clusters survive) over 3 and 12 months, under four
+  scenarios: as measured, an honest estimate (the month-by-month re-picking average, when
+  the rule was chosen on these trades), +$0.01 slippage, and no edge. Results per spread
+  and at each `--contracts` size (default 1 5 10 20), plus what a bad-case drawdown looks
+  like inside (trades, losers, winners, longest streak).
+- **Output:** `trades.csv`, `grid.csv`, `monthly_check.csv`, `offsets.csv`, `scaling.csv`, `scaling.png`,
+  `context_grid.csv`, `report.md`, `equity.png`, `grid.png`, `consistency.png`,
+  `offsets.png` and `context_grid.png`. Dollars are per one spread, before taxes.
+
+## Mean reversion (`meanrev.py`)
+
+A daily signal study of whether SPY mean-reverts over 1–5 sessions, to choose what to try with
+credit spreads. It uses SPY plus context ETFs (QQQ, IWM, TLT, HYG, GLD, UUP and VIXY as a VIX
+proxy) from Massive minute bars, back-adjusted for cash dividends.
+
+```bash
+uv run --env-file .env python meanrev.py --out output/meanrev                # design period only
+uv run --env-file .env python meanrev.py --final-test --out output/meanrev   # also the holdout, once
+```
+
+- **Timing:** every indicator uses prices up to 10 minutes before the close (15:50 ET) plus
+  earlier full sessions, so a signal can be acted on the same afternoon. Outcomes run from that
+  15:50 price to the 15:50 price 1, 2, 3 or 5 sessions later, plus the low/high in between.
+- **Periods:** design = sessions through 2024-12-31 (outcomes must end by then); holdout =
+  2025-01-01 onward, read only by `--final-test`. Every choice (52 indicators, dip and rally
+  events, classic rules, models, thresholds) is fixed in the code; the three primary holdout
+  hypotheses are picked from design results by `select_primary`.
+- **Analyses:** rank correlation of each indicator with forward returns (block-bootstrap
+  intervals, Benjamini-Hochberg q-values); dip and rally event studies with credit-spread odds
+  (how often a strike k% beyond the entry would have expired worthless); regime splits; classic
+  rules (Connors RSI(2), IBS, 3 down days, Bollinger) traded one position at a time; and
+  purged walk-forward logistic regression and boosted trees, next to a simple oversold score.
+- **Output:** `report.md`, `indicators_*.csv`, `events_*.csv`, `regimes_*.csv`, `rules_*.csv`,
+  `ml.csv`, `ml_importance.csv`, `features.parquet`, `indicators.png`, `event_paths.png`,
+  `ml.png`. A signal study of SPY, not option P&L.
+
+## Put spreads after dips (`dip_spreads.py`)
+
+Prices the mean-reversion study's dip signals as SPY put credit spreads with real option prices
+(Massive option minute bars, from 2024-10-01), and compares each signal with the same spread
+opened on every session.
+
+```bash
+uv run --env-file .env python dip_spreads.py --out output/dip_spreads
+```
+
+- **Primary test (fixed before any option price was seen):** "3+ down days in a row" at 15:50;
+  short put at the $1 strike at or below 1% under SPY's 15:50 price, long put $5 lower,
+  expiring 5 sessions later, held to expiry; holdout sessions (2025-01-01 on). The Connors
+  RSI(2) entry is the second pre-registered test.
+- **Exploratory grid:** expiries 1/2/3/5 sessions; short strike just in the money (the first
+  strike above SPY, as in the alert spreads), at the money, or 0.25% / 0.5% / 1% / 2% below;
+  $1 or $5 wide (compared by return on risk, since a $1 spread risks far less), held to expiry or a 50%/80% take profit, each with and without a breakeven
+  stop (armed once profit reaches 40% of the credit), closed at 15:50 on the first session SPY is
+  up (at most 5 sessions; also combined with the 80% take profit), other dip signals, and Oct-Dec 2024.
+- **Fills:** both legs must print in the same minute; entry at the first such minute from
+  15:50; settlement at intrinsic value from SPY's actual close on the expiry day. Strikes use
+  SPY's unadjusted price. Costs default to 0 (`--slippage`, `--commission`) and are always shown
+  with +$0.01 and +$0.03 slippage.
+- **Output:** `report.md`, `spreads.csv` (every spread, exit and cost), `stats.csv`,
+  `one_at_a_time.csv`, `signals.png`, `grid.png`, `equity.png`. Contract bars are cached per
+  contract in `data/cache/options_multi/` (about 11,000 contracts on the first run).
+
+## Put spreads after dips in single stocks (`stock_dip_spreads.py`)
+
+Runs the same put-spread test on single stocks (MSFT, AAPL, AMZN and META by default, `--tickers`
+to change), with SPY's spread alongside, and adds RSI(2) < 10 as a second trigger.
+
+```bash
+uv run --env-file .env python stock_dip_spreads.py --out output/stock_dip_spreads
+```
+
+- **Primary test (fixed before any stock option price was seen):** "3+ down days in a row" at
+  15:50; short put at the listed strike at or below 1% under the 15:50 price, long put at the
+  listed strike nearest 1.5% of the price lower; the first listed expiry at least 2 sessions out
+  (weeklies expire on Fridays, so 2-6 sessions); 80% take profit, else held to expiry; spreads
+  open over earnings skipped. Compared with the same spread on every session. The second test
+  adds RSI(2) < 10 as an alternative trigger.
+- **Exploratory:** at the money and 2% below, holding to expiry, RSI(2) < 10 alone, keeping the
+  earnings trades, and all tickers traded together (one spread at a time per ticker).
+- **Earnings:** not in the data plan, so in each late-month reporting window the session with the
+  biggest stock-specific volume jump and the one with the biggest stock-specific overnight gap
+  are flagged, with a session either side. The windows fit companies that report in late
+  Jan/Apr/Jul/Oct; check the dates listed in the report for other tickers, or pass exact dates
+  with `--earnings-csv` (columns `ticker,date`, the first session after each report).
+- **Fills and costs:** as in `dip_spreads.py`, shown at traded prices and with +$0.03, +$0.05
+  and +$0.10 slippage per leg (single-stock options trade wider than SPY's). Strikes and expiries
+  come from Massive's options contracts reference; a split inside the option window stops the
+  run.
+- **Output:** `report.md`, `spreads.csv`, `stats.csv`, `tickers.png`, `combined.png`.
+
+## Gap-down recoveries (`gap_recovery.py`)
+
+A price study, no options: when a ticker opens at least 1% below the previous close (SPY, MSFT,
+AAPL, AMZN and META by default), how often does the gap fill, when, and how much comes back if it
+doesn't?
+
+```bash
+uv run --env-file .env python gap_recovery.py --out output/gap_recovery
+uv run --env-file .env python gap_recovery.py --min-gap 0.25 --out output/gap_recovery_small   # small gaps too
+```
+
+- **Gap:** the first regular minute's open against the previous session's last regular close; on
+  an ex-dividend morning the payout is taken out of the gap. A missing session never makes a gap.
+- **Measured per gap:** whether and when the price trades back at the previous close that session;
+  the best recovery and the close as a % of the gap; how far it fell first; whether it fell another
+  gap's worth below the open, and which of the two came first; fills within 1, 2, 3, 5 and 10
+  sessions.
+- **Splits:** gap size (0.25-0.5%, 0.5-1%, 1-2%, 2-3%, 3-5%, 5%+; buckets below `--min-gap` stay
+  empty) and kind: earnings (inferred, see `stock_dip_spreads.py`), with the market (SPY also opened
+  1%+ lower, or `--min-gap` if that is smaller) or the stock alone.
+- **Filter tests** (fixed before any filtered result was seen): skip earnings; then skip the first 30
+  minutes and measure from the 10:00 price (gaps already filled by 10:00 count as missed); then split
+  by whether the 10:00 price is above or below the open. The yardstick is the race: did the price reach
+  the previous close before falling as far again below the entry price? About 50% means no edge.
+  A higher fill rate alone is not an edge, because a stock that has already bounced has less ground
+  to cover and a closer stop.
+- **Renamed tickers:** sessions Massive files only under a former ticker are filled from it (META's
+  2022-01-31 to 2022-06-08 sessions come from FB).
+- **Output:** `report.md`, `gaps.csv` (one row per gap), `summary.csv`, `outcomes.png`, `later.png`,
+  `filters.png`.
+
+## Intraday mean reversion for a scalper (`scalp_meanrev.py`)
+
+A signal study on stock minute bars, no options: after a stretched 5-minute bar, does price snap
+back over the next 5-30 minutes by more than a scalper's costs? Signals only from 10:30 to 15:00 ET.
+
+```bash
+uv run --env-file .env python scalp_meanrev.py --out output/scalp_meanrev                 # design period
+uv run --env-file .env python scalp_meanrev.py --final-test --out output/scalp_meanrev    # adds the holdout
+```
+
+- **Tickers:** SPY, QQQ, IWM, MSFT, AAPL, AMZN, META; each alone and pooled (index ETFs, stocks).
+- **Round 1 (fixed before any result):** 27 signals, each long (buy the stretch below) and short (fade
+  the stretch above): 9/20 EMA stretches in ATRs, VWAP bands, RSI(2) and RSI(14) extremes, Bollinger
+  bands, runs of same-colour bars, sharp 15-minute moves, and seven combinations (with or against the
+  20/50 EMA trend, with the daily trend, a Bollinger hook, RSI(2) plus a VWAP band, a run plus VWAP).
+- **Round 2 (fixed after round 1 came back empty):** stretches on 2x normal volume or on quiet volume,
+  on volatile days, after 3+ daily down (up) days, on 0.5%+ gap days, and the core signals on
+  2-minute bars. Each round has its own multiple-testing correction.
+- **Outcome:** the move in bps over 5, 10, 15 (primary) and 30 minutes from the signal bar's close, in
+  the signal's direction; the excess over any bar in the same half hour; and a +1 / -1 ATR bracket
+  within 30 minutes. Uncertainty is clustered by day.
+- **Selection:** design 2022-2024; a signal qualifies with enough events, a positive excess with BH
+  q < 0.10, and an average move above an illustrative round-trip cost (1 bp ETFs, 2 bps stocks). The
+  2025+ holdout is read only with `--final-test`, for the qualifiers.
+- **Output:** `report.md`, `stats.csv`, `design.csv`, `events.parquet`, `design.png` (and with
+  `--final-test`, `holdout.csv`, `holdout.png`).
+
+## Intraday momentum (`intraday_momentum.py`)
+
+Does the morning's move predict the last half hour (published for SPY)? At 15:30, long after an up
+morning (previous close to 10:00, net of a dividend paid that morning), short after a down one, to the
+close; also the 15:00-15:30 move and both agreeing; volatile mornings split out. SPY (primary), QQQ,
+IWM; design to 2024, the 2025+ holdout only with `--final-test`.
+
+```bash
+uv run --env-file .env python intraday_momentum.py --out output/intraday_momentum
+```
+
+Output: `report.md`, `stats.csv`, `days.csv`, `momentum.png`.
+
+## Trend following on ETFs (`trend_etfs.py`)
+
+Long in uptrends, short (or flat) in downtrends, for SPY, QQQ, IWM, TLT, GLD, UUP and HYG at equal risk
+(10% a year each, from 60-session volatility, at most 2x), after 2 bps per unit traded. Rules: 1- and
+3-month momentum and the 50- and 100-session average, long/short and long/flat; decisions at 15:50
+from 2022-03-01. Compared with buying and holding SPY or the seven ETFs, with SPY dip buying (meanrev's
+"3 down days; exit on the first up day"), and with half trend, half dip buying.
+
+```bash
+uv run --env-file .env python trend_etfs.py --out output/trend_etfs
+```
+
+Output: `report.md`, `rules.csv`, `daily.csv`, `trend.png`. Five years hold one bear market, so the
+longer classic rules (6-12 months, 200 days) need more history.
+
+## Call credit spreads, 30-45 days out (`call_spreads.py`)
+
+Sells a SPY call credit spread every session at 15:50 with real option prices (from 2024-10-01): the
+weekly expiry closest to 30 or 45 days out (more than 21), the short call at the $5 strike whose delta
+is closest to 0.20, 0.30 or 0.40, the long call $5 or $10 higher, entered as a working order (the first
+minute both legs trade, through 10:30 the next morning).
+
+```bash
+uv run --env-file .env python call_spreads.py --out output/call_spreads
+```
+
+- **Delta:** from each strike's own implied volatility (Black-76 on the forward from the at-the-money
+  call and put, last trades from 14:50 to 15:50); no quotes or Greeks are in the data plan.
+- **Exits:** held to expiry, 50% take profit, closed at 21 days to expiry, 50% or 21 days, and 50%
+  with a stop at a loss of 2x the credit. Primary: 45 days, 0.30 delta, $5 wide, 50% or 21 days.
+- **Entry filters:** after 3+ up days, RSI(2) above 90, below the 50-day average, volatile periods.
+- **Costs:** traded prices, +$0.03 (main tables) and +$0.05 per share per leg per fill.
+- **Output:** `report.md`, `spreads.csv`, `stats.csv`, `entries.csv`, `grid.png`, `equity.png`.
+
+## Iron condors, 30-45 days out (`iron_condors.py`)
+
+The direction-neutral version of the call spreads: a call credit spread above and a put credit spread
+below, same expiry, both short strikes at the same delta (0.20, 0.30 or 0.40), $5 or $10 wings, 30 or 45
+days out, entered every session like `call_spreads.py`. Exits apply to the condor's total value; filters
+are volatile, calm and below the 50-day average.
+
+```bash
+uv run --env-file .env python iron_condors.py --out output/iron_condors
+```
+
+Output: `report.md`, `condors.csv`, `stats.csv`, `grid.png`, `equity.png`; the report also splits each
+condor's result into its call and put sides.
+
+## Three red bars by timeframe (`red_bars.py`)
+
+Does the "3 down days" bounce carry to shorter bars? After 3+ red bars in a row on 5-minute, 15-minute,
+1-hour, 4-hour and daily bars (SPY, QQQ, IWM), the move over the next 1, 3 and 5 bars against any bar of
+the same size, plus a +/-1 ATR race. Red means a red candle (close below open) or a down close (below the
+previous close). Design to 2024; the 2025+ holdout only with `--final-test`, for qualifiers.
+
+```bash
+uv run --env-file .env python red_bars.py --out output/red_bars
+```
+
+Output: `report.md`, `stats.csv`, `design.csv`, `red_bars.png`.
+
+## Bottoming and topping candle patterns (`bar_patterns.py`)
+
+Red-red-red-green-red (bought) and green-green-green-red-green (faded), each also with a higher low /
+lower high, on 5-minute, 15-minute and 1-hour bars for SPY, QQQ and IWM, measured like `red_bars.py`
+(next 1/3/5 bars in the signal's direction against any bar, a +/-1 ATR race; design to 2024, holdout only
+with `--final-test`).
+
+```bash
+uv run --env-file .env python bar_patterns.py --out output/bar_patterns
+```
+
+Output: `report.md`, `stats.csv`, `design.csv`, `patterns.png`.
+
+## Support and resistance levels (`levels.py`)
+
+Do widely watched levels hold? Levels known before the open: yesterday's high, low and close, last week's
+high and low, today's pre-market high and low, yesterday's volume POC and value area (bar-approximated),
+and the nearest whole dollar and multiple of $5 below and above the open. For the first touch of each level
+during regular hours, a race from the level: it held if price moved 0.1 (or 0.25) daily ATR back away
+before going as far through it. Every real level is compared with fake ones measured the same way: 10 per
+level and session at distances from the open drawn from the same level's other days, plus (a check added
+after the first results) fakes 0.2-0.4 ATR either side of the real level on the same session. SPY, QQQ and
+IWM; design to 2024, the 2025+ holdout only with `--final-test`, for qualifiers.
+
+```bash
+uv run --env-file .env python levels.py --out output/levels
+uv run --env-file .env python levels.py --chart 2024-08-05 2024-03-04:2024-03-08 --chart-ticker SPY --out output/levels
+```
+
+Output: `report.md`, `stats.csv`, `design.csv`, `pooled.csv`, `near.csv`, `events.parquet`, `levels.png`.
+`--chart` skips the study and writes `charts/<ticker>_<date>.png` (the session's 5-minute candles with every
+level, after yesterday's session and today's pre-market in grey, marking each level's first touch and whether
+it held or broke) plus `charts/<ticker>_levels.csv`.
+
+## Swings on a 5-minute chart (`swings.py`)
+
+Swings come from a zigzag on 5-minute bars that restarts each session (a turn needs a reversal of 0.15
+daily ATR, about $0.90 on SPY). Part 1: do the session's own swing highs and lows act as support and
+resistance? Each swing becomes a line when it is confirmed, but not before 11:30 ET, and is measured like
+`levels.py` (first touch, the +/-0.1 ATR race, random and near fake lines). Part 2: is the time between peaks
+and valleys more regular, or more predictable, than in random-direction copies of the same sessions (each
+5-minute bar keeps its size but is flipped up or down at random, so the volatility pattern stays and any
+memory goes)? SPY, QQQ and IWM; design to 2024, the 2025+ holdout only with `--final-test`.
+
+```bash
+uv run --env-file .env python swings.py --out output/swings
+uv run --env-file .env python swings.py --chart 2024-03-05 --chart-ticker SPY --out output/swings
+```
+
+Output: `report.md`, `stats.csv`, `design.csv`, `near.csv`, `timing.csv`, `events.parquet`, `swings.png`.
+`--chart` skips the study and writes `charts/<ticker>_<date>.png`: the session's 5-minute candles, its zigzag
+with minutes per leg, and each swing line from the time it is drawn, with its first touch and outcome.
+
+## Breakout trades at key levels (`breakouts.py`)
+
+A trade simulation of the `levels.py` finding that price runs through some levels: a stop order at
+yesterday's high or last week's high (long, when the session opens below it) or at yesterday's close
+(either side), filled at its first touch, with a stop back through the level and a target beyond it
+(0.1 ATR primary; 0.25 ATR and stop-only exits too), 0/1/2 bps per side. Yesterday's and last week's low
+(short breakdowns) are reported as a check. TSLA, SPY, QQQ and IWM; the same trades at random fake levels
+as the baseline; design to 2024, the 2025+ holdout only with `--final-test`, for qualifiers.
+
+Minute bars can't show whether a dip to the stop inside the fill minute came before or after the fill, so
+every result has two bounds: *worst* (fixed in advance; it makes even random levels lose several bps a
+trade) and *best* (random levels come out near zero).
+
+```bash
+uv run --env-file .env python breakouts.py --out output/breakouts
+```
+
+Output: `report.md`, `stats.csv`, `tests.csv`, `trades.parquet`, `breakouts.png`. Results are per share of
+the stock or ETF, gross of commissions, never options P&L.
+
+## TSLA breakout check with shares and options (`breakout_check.py`)
+
+The one-time 2025-26 check of the TSLA breakout trades from `breakouts.py`: long through yesterday's high,
+through yesterday's close (either side) and short through yesterday's low, with a 0.1 ATR stop and target.
+Fills are replayed on Massive one-second bars, so the order inside a minute is known. Each share trade also
+buys one at-the-money option (a call for longs, a put for shorts, the first expiry after the trade date), priced
+at the first option trades after the share fill and exit, plus $0.02/$0.05/$0.10 per share of slippage per fill
+(option prices are trades; the plan has no quotes). Without `--final-test` it is a dry run on 2021-24, with
+options for 2024-10 to 2024-12 only (the option data starts 2024-10-01).
+
+```bash
+uv run --env-file .env python breakout_check.py --out output/breakout_check                # dry run
+uv run --env-file .env python breakout_check.py --final-test --out output/breakout_check   # 2025-26, once
+```
+
+Output in `design/` or `holdout/`: `report.md`, `shares.parquet`, `options.parquet`, `share_stats.csv`,
+`option_stats.csv`, `tests.csv`, `settings.json`, `check.png`. One-second bars are cached in
+`data/cache/seconds/`.
+
+## Kalman SuperTrend + ADX volatility waves (`kalman_supertrend.py`)
+
+The user's Pine Script strategy (v3.7) rebuilt from its source: 5-minute bars with extended hours, a Kalman-
+smoothed close (in effect a 9-bar EMA) as the centre of a SuperTrend (ATR 7 x 2), BUY/SELL on flips during
+regular hours, and the script's exits (1.5 ATR stop, 2 ATR target, breakeven after 1 ATR, the outer volatility
+wave, a 12-bar time stop). Fills a minute after each signal, stops and targets on minute bars, 1-tick slippage.
+Compared with random entries that use the same exits, and with the move after each flag. SPY, plus QQQ, IWM and
+TSLA for reading; variants flat by the close and on a regular-hours chart.
+
+```bash
+uv run --env-file .env python kalman_supertrend.py --out output/kalman_supertrend
+```
+
+Output: `report.md`, `stats.csv`, `random_compare.csv`, `flag_moves.csv`, `years.csv`, `trades.parquet`,
+`strategy.png`. Results are per share of the ETF or stock, never options P&L.
+
+## The Kalman SuperTrend as 0DTE options (`supertrend_0dte.py`)
+
+The trades from `kalman_supertrend.py` (SPY, flat by the close), taken the way the script's author says they
+trade it: a same-day at-the-money call for a BUY or put for a SELL, at the $1 strike nearest the share fill,
+bought and sold when the share trade enters and exits. Option prices are Massive one-minute trades (no quotes on
+the plan) plus $0.01/$0.02/$0.05 a share of slippage per fill; per contract, no commissions. Only the sessions the
+option plan covers (a rolling two years).
+
+```bash
+uv run --env-file .env python supertrend_0dte.py --out output/supertrend_0dte
+```
+
+Output: `report.md`, `stats.csv`, `trades.parquet`, `options.png`.
+
+## Five-indicator scalper (`confluence_scalper.py`)
+
+A strategy built on the five indicators a Reddit author lists for their 0DTE scalper, each reimplemented: MACD
+(ChrisMoody, SMA signal), Squeeze Momentum (LazyBear), SuperTrend AI (LuxAlgo's k-means clustering of SuperTrend
+factors), a Larry Williams swing-structure stand-in for Pure Price Action (LuxAlgo), and the ADX Volatility Waves
+approximation. BUY when SuperTrend AI is bullish, MACD is above its signal, squeeze momentum is positive and rising,
+structure is bullish and price is below the upper wave, all together for the first time; SELL the mirror. SPY
+5-minute bars (QQQ, IWM, TSLA for reading), flat by the close; exit A = `kalman_supertrend.py`'s bracket exits,
+exit B = hold until SuperTrend AI turns. Compared with plain SuperTrend AI flips and with random entries taken
+while SuperTrend AI points the same way. Design to 2024; 2025-26 only with `--final-test`.
+
+```bash
+uv run --env-file .env python confluence_scalper.py --out output/confluence_scalper
+```
+
+Output: `report.md`, `stats.csv`, `random_compare.csv`, `tests.csv`, `trades.parquet`, `strategy.png`.
+
+## Green Goose (`green_goose.py`)
+
+An overnight options strategy from a Substack post: at 15:50 buy an at-the-money call or put, sell the next
+morning. Direction: Wilder RSI(2) above 85 -> puts, below 15 -> calls, otherwise with the day's candle; overridden
+by ADX moving between the DI lines (puts if -DI leads) and then by RSI(2) crossing into that zone; no trade when
+ADX is above 60 (version 1: ADX/DMI 5, version 2: 6). First the stock moves from 15:50 to the next open, 9:35,
+9:40, 10:00 and 11:00 in the signal's direction (SPY, QQQ, IWM, AAPL, META, five years), against calls and puts in
+the same mix at random. Then SPY options from the plan's option data: delta 0.47-0.53 and theta below -0.12 by
+Black-76 from traded prices, expiry 5+ days out (or the next session), version 2 out at 9:35, version 1 with its
+opening-price rules and a 10% trailing stop until 11:00.
+
+```bash
+uv run --env-file .env python green_goose.py --out output/green_goose
+uv run --env-file .env python green_goose.py --skip-options --out output/green_goose   # stocks only
+```
+
+Output: `report.md`, `stocks.csv`, `options.csv`, `option_trades.parquet`, `tests.csv`, `green_goose.png`.
+
+## Green Goose indicator search (`goose_indicators.py`)
+
+Which conditions known at 15:50 tell how SPY moves overnight, so Green Goose can keep the pieces that help and add
+new ones. It tests Green Goose's own pieces (RSI(2) extremes, the candle, ADX entering the DI zone, RSI(2) stabs, ADX
+above 60) and 23 new ones (IBS, Bollinger bands, closing streaks, big days, MFI, the 50-day average, MACD, the last
+half hour, the opening gap, VIXY moves, volume, the turn of the month, weekends). Each is judged on the move from
+the 15:50 price to the next open over 2021-10 to 2024-09, against the same condition slid to other dates, and must
+point the same way on QQQ and IWM. The kept ones vote for calls, puts or no trade. The resulting rule is checked once
+on 2024-10 to 2026-09, as stock moves and as Green Goose's SPY options (same contracts, version 1 exits).
+
+```bash
+uv run --env-file .env python goose_indicators.py --out output/goose_indicators
+```
+
+Output: `report.md`, `screen.csv`, `stocks.csv`, `options.csv`, `per_condition.csv`, `tests.csv`, `screen.png`,
+`options.png`.
+
+## Green Goose as $1 credit spreads (`goose_spreads.py`)
+
+Green Goose's 15:50 direction sold as a $1 SPY vertical expiring the next session, instead of buying an at-the-money
+option: a put spread when it's bullish, a call spread when it's bearish. The main strike placement is the one in
+`alert_spreads.py` (short leg at or just in the money); $1 and $2 further out of the money are shown for reading.
+Exits: buy back at 9:35, take profit at 80% of the credit (else buy back at 15:30), or hold to expiry. Compared with
+selling a put or call spread every night and with the opposite of Green Goose, at $0-$0.03 slippage per leg per fill.
+
+```bash
+uv run --env-file .env python goose_spreads.py --out output/goose_spreads
+```
+
+Output: `report.md`, `stats.csv`, `tests.csv`, `trades.parquet`, `spreads.png`.
+
+## TSLA breakouts with a buying-pressure filter (`breakout_flow.py`)
+
+The two TSLA breakout rules from `breakout_check.py` (long through yesterday's high, short through yesterday's low),
+taken only when order flow before the touch points the trade's way. Order flow is approximated from one-second bars:
+each second's volume counts as buying or selling by its price change, and pressure is (buying - selling) / total over
+the 5 minutes before the fill (1 and 15 minutes for reading). Tested on 2021-24. 2025-26 was already used for the rules'
+one-time check, so it is read only with `--final-test`.
+
+```bash
+uv run --env-file .env python breakout_flow.py --out output/breakout_flow
+```
+
+Output (in `design/` or `holdout/`): `report.md`, `stats.csv`, `splits.csv`, `trades.parquet`, `settings.json`,
+`pressure.png`.
+
+## Bollinger + RSI scalp with trap filters (`band_scalp.py`)
+
+A user-supplied mean-reversion scalp, tested as written on 5-minute bars of SPY, QQQ and 12 mega caps (NVDA, MSFT,
+AAPL, GOOGL, AMZN, META, AVGO, TSLA, JPM, WMT, LLY, V).
+- **Entry:** a bar pierces a Bollinger band (20, 2) with RSI(14) beyond 30/70, and a later bar closes back inside.
+- **Filters:** the 1-hour 200 EMA, a cap on band-width growth, a previous-session POC/VAH/VAL at the pierce, and
+  order flow from one-second bars (divergence or absorption, no accelerating pressure).
+- **Exits:** a stop beyond the pierce wick, the middle band as the target, out after 10 bars.
+- **Study design:** the choices the spec leaves open are fixed in the script's docstring. The report adds the filters
+  one at a time. Design is 2022-24; 2025-26 is read only with `--final-test`.
+
+```bash
+uv run --env-file .env python band_scalp.py --out output/band_scalp
+```
+
+Output (in `design/` or `holdout/`): `report.md`, `stats.csv`, `tests.csv`, `setups.parquet` and `trades.parquet`
+(every setup's and trade's indicator and filter states), `settings.json`, `filters.png`.
+
 ## Output (in `--out`)
 
 - `candidates.parquet`: one row per trigger, with configuration, segment, `signal_time`
