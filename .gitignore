@@ -5,3 +5,6 @@ __pycache__/
 data/
 output/
 .DS_Store
+
+# Private alert logs (this repo is public)
+data-files/
