@@ -75,6 +75,15 @@ uv run --env-file .env python goose_indicators.py --out output/goose_indicators 
 uv run --env-file .env python goose_spreads.py --out output/goose_spreads   # Green Goose's direction as $1 SPY credit spreads
 uv run --env-file .env python breakout_flow.py --out output/breakout_flow   # TSLA breakouts with an order-flow (buying-pressure) filter
 uv run --env-file .env python band_scalp.py --out output/band_scalp   # Bollinger + RSI scalp with trap filters (SPY, QQQ, 12 mega caps)
+uv run --env-file .env python market_daily.py   # whole-market daily bars and the stock list, for universes picked by rule
+uv run --env-file .env python volatile_breakouts.py --out output/volatile_breakouts   # TSLA breakout rules on each month's most volatile stocks (--final-test = 2025-26)
+uv run --env-file .env python rebalancing.py --out output/rebalancing   # month-end 60/40 rebalancing flows on SPY, IWM and QQQ
+uv run --env-file .env python shock_drift.py --out output/shock_drift   # drift after heavy-volume moves in the 300 most traded stocks, hedged with SPY
+uv run --env-file .env python close_momentum.py --out output/close_momentum   # into-the-close momentum on big days (SPY, QQQ, IWM)
+uv run --env-file .env python close_momentum_stocks.py --out output/close_momentum_stocks   # the same in each month's most volatile stocks
+uv run --env-file .env python trident.py --out output/trident   # TG Capital's FVG + doji "Trident" on 30-minute bars, in R vs random entries (--final-test = 2025-26)
+uv run --env-file .env python trident_fx.py --out output/trident_fx   # the same on 5 forex pairs + gold in the London kill zone (needs Currencies Starter; --download-only caches 2010-on; --final-test = 2024-26)
+uv run --env-file .env python trident_fx.py --as-traded --out output/trident_fx   # looser rules read from two of his winning trades
 ```
 
 - **Checking a change:** `demo.py` is the quickest end-to-end check without credentials,
@@ -160,8 +169,8 @@ per-contract multi-session bars (`contract_loader`), against the same spread on 
 and weekly expiries come from the options contracts reference (`load_chain`, `pick_strikes`,
 `pick_expiry`), and spreads open over earnings are skipped (`earnings_days`, inferred from
 volume and gaps). `gap_recovery.py` is a price study of gap-down opens (`gap_events` per ticker,
-`summarize` per group); `run_study` does no file I/O, and `load_ticker` fills sessions a renamed
-ticker lacks from its old ticker (`FORMER`). `scalp_meanrev.py` tests intraday mean-reversion signals on 5- and
+`summarize` per group); `run_study` does no file I/O, and `load_minutes` fills sessions a renamed
+ticker lacks, and every session before its rename (`RENAMED`), from its old ticker (`FORMER`). `scalp_meanrev.py` tests intraday mean-reversion signals on 5- and
 2-minute bars (`signal_masks`, `round2_masks`, `fast_masks`), with outcomes for every bar in the
 10:30-15:00 window (`bar_outcomes`) so the excess can use a time-of-day baseline; the 2025+ holdout is
 read only with `--final-test`. `intraday_momentum.py` (`day_table`, `signal_outcomes`) and `trend_etfs.py` (`trend_signal`,
@@ -201,6 +210,29 @@ from one-second bars with volume (`second_loader(volume=True)`, its own cache) b
 `band_scalp.py` tests a Bollinger + RSI scalp on 5-minute bars (`five_minute_bars`, `find_setups`) with trend, band-width,
 volume-profile level (`profile_levels`) and order-flow filters (`bar_deltas`, `cvd_flags`), traded on minute bars
 (`simulate`).
+`market_daily.py` caches Massive's grouped daily bars (every stock and ETF, one Parquet file per session,
+split-adjusted and unadjusted: `load_grouped`) and the common-stock/ADR list (`stock_types`), so universes can be
+picked by rule, delisted stocks included. `portfolio_check.py` holds what every edge study reports next to the
+keepers: SPY dip buying's daily returns (`spy_dip_daily`), the TSLA breakouts' daily returns from breakout_check's
+saved trades (`tsla_breakout_daily`), `correlations`, `one_at_a_time` and `account`.
+`volatile_breakouts.py` picks each month's most volatile liquid stocks from the grouped bars (`daily_panels`,
+`pick_universe`, using only sessions before the month), loads minute bars per run of months (`download_spans`,
+`load_span`), and trades breakouts.py's levels there with breakout_check's one-second replay (`span_entries`,
+`breakout_check.replay_all(width=...)`, `bodies` for a wick-free check), with per-share costs at the unadjusted price
+(`add_net`), fake-level excess (`excess`) and a one-position account view (`portfolio_view`).
+`rebalancing.py` measures a 60/40 SPY/IEF portfolio's drift since the last month-end (`calendar_signal`) and trades
+against it over fixed windows of the month (`window_trades`, `reversal_trades`), with slid windows as the baseline.
+`shock_drift.py` finds heavy-volume moves of 3+ standard deviations against SPY in a monthly top-300 universe
+(`monthly_universe`, `event_table`, `space_events`) and measures SPY-hedged returns from the next open
+(`trade_returns`). `close_momentum.py` trades the last half hour in the direction of a big day's move
+(`day_table`, `trades`, `difference`); `close_momentum_stocks.py` does the same on volatile_breakouts' universe
+(`span_days`, `pick`). `trident.py` finds TG Capital's pattern on 30-minute bars (`thirty_minute_bars`,
+`fvg_table`, `entries` per row of `ROWS`) and measures it in R on minute bars (`outcomes`: +kR races, excursions
+before the stop, a +2R/-1R bracket, the daily-EMA exit) against same-time random entries with stops matched in ATRs
+(`random_matches`); the design run drops every session after 2024 before computing anything (`study_minutes`).
+`trident_fx.py` runs trident.run_study on Massive currency minutes with its own pieces: 17:00 ET trading days
+(`fx_sessions`, `fx_minutes`, `prepare`), yearly cached downloads that tell data gaps from truncated paging
+(`load_fx`), the quoted spread at each entry (`spread_loader`) and gold's close-based stop (`CLOSE_STOP`).
 
 Every rule the source brief marked as an assumption is a key in `vwap_sauce.DEFAULTS`, and
 a CLI flag. The choices the brief leaves open are listed in `vwap_sauce.IMPLEMENTATION`.
@@ -274,6 +306,12 @@ Missing minutes are never filled. Gaps are dropped and reported (in the coverage
 - **Commit identity:** git has no global identity on the user's machine. Commit with
   `git -c user.name=… -c user.email=…`, using the identity from
   `git log -1 --format='%an <%ae>'`.
+- **Forex data:** Currencies Starter (added 2026-10-15) has minutes from 2010 and quotes, cached per year in
+  `data/cache/fx/`. Massive has no NZDUSD minutes 2020-10-26..2020-12-31 and almost no gold minutes
+  2010-09-27..2013-07; `load_fx` caches those years as gaps after checking the next weekdays. Bars are built from
+  bids. Minutes around the 17:00 ET roll hold off-market quotes, so `fx_minutes` drops 16:55-17:10 ET. From
+  2021-01, most minute lows (some highs) come from a pip-rounded bid 1-2 pips under the market; not corrected,
+  so reports split 2010-20 from 2021 on.
 - **Live data:** real Massive downloads have worked since 2026-09-29 (SPY, QQQ and NVDA
   runs). Minute history on the current plan appears to start around 2021-09-30: NVDA
   requested from 2020 comes back starting then, and the missing earlier sessions are

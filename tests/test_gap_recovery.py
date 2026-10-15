@@ -120,6 +120,21 @@ def test_sessions_missing_under_a_renamed_ticker_come_from_its_old_ticker(tmp_pa
     assert "2 META sessions" in note and "FB" in note
 
 
+def test_bars_before_a_rename_come_from_the_old_ticker_even_when_the_new_one_has_some(tmp_path, monkeypatch):
+    monkeypatch.setitem(gr.RENAMED, "META", pd.Timestamp("2025-03-05"))
+    sessions = features.trading_sessions("2025-03-03", "2025-03-07", warmup_sessions=0)
+    first, last = "2025-03-03", "2025-03-07"
+    other = {d: np.full(390, 13.0) for d in ["2025-03-03", "2025-03-04"]}  # another security under the ticker
+    new = {d: np.full(390, 100.0 + k) for k, d in enumerate(["2025-03-05", "2025-03-06", "2025-03-07"])}
+    minutes_for(sessions, {**other, **new}).to_parquet(tmp_path / f"META_1min_{first}_{last}_splitadj.parquet")
+    minutes_for(sessions, {"2025-03-03": np.full(390, 50.0), "2025-03-04": np.full(390, 51.0)}).to_parquet(
+        tmp_path / "FB_1min_2025-03-03_2025-03-04_splitadj.parquet")
+    minutes, note = gr.load_minutes("META", sessions, tmp_path)
+    daily, _ = gr.mr.daily_table(minutes, sessions)
+    assert daily["close"].tolist() == [50.0, 51.0, 100.0, 101.0, 102.0]
+    assert "2 META sessions" in note
+
+
 def test_from_10_oclock_the_measures_start_at_the_10_oclock_price():
     flat = np.full(390, 100.0)
     # Opens at 97, is at 98 at 10:00 (up since the open), reaches 100.1 by minute 120.

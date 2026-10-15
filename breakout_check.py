@@ -235,8 +235,9 @@ def candidates(minutes, sessions, period):
     return trades, rth
 
 
-def replay_all(trades, rth, seconds_of, ticker=TICKER):
-    """Replays each trade (rows of `candidates`) second by second; adds fill, exit, their times and gross bps."""
+def replay_all(trades, rth, seconds_of, ticker=TICKER, width=WIDTH):
+    """Replays each trade (rows of `candidates`) second by second, with the stop and target `width` ATR from the
+    level; adds fill, exit, their times and gross bps."""
     days = rth.groupby("session").indices
     ms, hi, lo, cl = _ns(rth["ts"]) // 1_000_000, *(rth[k].to_numpy(float) for k in ("high", "low", "close"))
     open_ms = _ns(rth["session_open"]) // 1_000_000
@@ -248,7 +249,7 @@ def replay_all(trades, rth, seconds_of, ticker=TICKER):
             e = int(np.searchsorted(ms[b], open_ms[b[0]] + int(r.entry_minute) * MINUTE_MS))
             want.append((ticker, int(ms[b][e]), int(ms[b][e]) + MINUTE_MS - 1))
             d = -r.side
-            stop, target = r.price - d * WIDTH * r.atr, r.price + d * WIDTH * r.atr
+            stop, target = r.price - d * width * r.atr, r.price + d * width * r.atr
             touch = (lo[b] <= stop) | (hi[b] >= target) if d > 0 else (hi[b] >= stop) | (lo[b] <= target)
             later = np.flatnonzero(touch[e + 1:])
             if later.size:
@@ -260,7 +261,7 @@ def replay_all(trades, rth, seconds_of, ticker=TICKER):
         b = days[r.session]
         e = int(np.searchsorted(ms[b], open_ms[b[0]] + int(r.entry_minute) * MINUTE_MS))
         d = -r.side
-        stop, target = r.price - d * WIDTH * r.atr, r.price + d * WIDTH * r.atr
+        stop, target = r.price - d * width * r.atr, r.price + d * width * r.atr
         res = replay(ms[b], hi[b], lo[b], cl[b], e, r.price, d, stop, target,
                      lambda start: seconds_of(ticker, start, start + MINUTE_MS - 1), ms[b][-1] + MINUTE_MS - 1)
         if res is None:

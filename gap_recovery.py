@@ -46,7 +46,10 @@ EPS = 1e-9
 WAIT = 30                                         # minutes after the open: the filter tests start at 10:00
 # Renamed tickers: Massive files some sessions before a rename only under the old ticker (META was FB until
 # 2022-06-09, and Massive has no META bars for 2022-01-31..2022-06-08), so missing sessions are filled from it.
+# Before RENAMED's date the new ticker's bars can belong to another security (until 2022-01-28 Massive's META bars
+# are the Roundhill metaverse ETF at about $13), so they are dropped and those sessions come from the old ticker too.
 FORMER = {"META": "FB"}
+RENAMED = {"META": pd.Timestamp("2022-06-09")}
 
 
 def _label(lo, hi):
@@ -618,13 +621,17 @@ def plot_filters(res, path):
 # ---------------------------------------------------------------- CLI
 
 def load_minutes(ticker, sessions, cache_dir="data/cache", refresh=False):
-    """(minute bars, note) over the sessions' span. Sessions missing under the ticker are filled from its former
-    ticker (FORMER) when it has one. Shared with scalp_meanrev.py."""
+    """(minute bars, note) over the sessions' span. Sessions missing under the ticker, and every session before its
+    rename (RENAMED), come from its former ticker (FORMER) when it has one. Shared with scalp_meanrev.py."""
     first, last = str(sessions.index[0].date()), str(sessions.index[-1].date())
     minutes, _ = download.load_minute_bars(ticker, first, last, cache_dir=cache_dir, refresh=refresh,
                                            final_close=sessions["close"].iloc[-1])
     note = ""
     if ticker in FORMER:
+        cut = RENAMED.get(ticker)
+        if cut is not None and sessions.index[0] < cut:
+            days = minutes["ts"].dt.tz_convert(NY).dt.tz_localize(None).dt.normalize()
+            minutes = minutes[days >= cut].reset_index(drop=True)
         daily, _ = mr.daily_table(minutes, sessions)
         missing = daily.index[daily["close"].isna()]
         if len(missing):
