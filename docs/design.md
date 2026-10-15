@@ -386,7 +386,11 @@ choices made where the brief is silent.
   target - price_10 as the yardstick (best_10, close_10, and the race against a low <= price_10 -
   (target - price_10)). `FILTERS` lists the five filter tests and where each one's measures start.
 - **Renamed tickers:** `FORMER` maps a ticker to its old one; missing sessions inside the span of
-  missing sessions are taken from the old ticker's cached minutes (META <- FB, 90 sessions in 2022).
+  missing sessions are taken from the old ticker's cached minutes (META <- FB). `RENAMED` gives the first
+  session under the new ticker: the new ticker's bars before it are dropped first, because they can be another
+  security (Massive's META bars until 2022-01-28 are the Roundhill metaverse ETF at about $13), so all of META's
+  sessions before 2022-06-09 come from FB. Found 2026-10-14; earlier runs of scripts that load META from 2021
+  (gap_recovery, scalp_meanrev, band_scalp's January 2022) used the ETF's bars for those weeks.
 
 ## How correctness was checked (2026-09-28)
 
@@ -738,4 +742,109 @@ choices made where the brief is silent.
   - Entry at the open of the first minute at or after the entry bar's end.
   - Exits are checked minute by minute until 50 minutes after entry. Within a minute the stop is checked before the
     target; a stop gapped through fills at the open. The time exit is the last minute's close.
+
+
+## Whole-market daily bars (`market_daily.py`)
+
+- **Grouped daily bars:** Massive's `get_grouped_daily_aggs`, one request and one cached Parquet file per session, in
+  `grouped/splitadj/` and `grouped/unadjusted/`. Their open, high and low match the regular-hours minute bars; the
+  close is the official closing price (a few bps from the last minute's close). A session outside the plan's rolling
+  history returns NOT_AUTHORIZED and is skipped, not cached.
+- **Stock types:** `list_tickers` for types CS and ADRC, active and delisted, so a universe picked from the grouped
+  bars has no survivorship bias.
+
+## Breakouts in volatile stocks (`volatile_breakouts.py`)
+
+- **Universe** (`pick_universe`): for each month, the 21 sessions before its first session in the grouped bars;
+  eligible stocks traded on all of them, with median VWAP x volume >= $500M and an unadjusted close >= $10 on the last;
+  ranked by mean true range / previous close (split-adjusted). Ranks 1-10 are the core, 11-20 the related set; TSLA is
+  excluded. A test checks that changing data from the month's first session on leaves its picks unchanged.
+- **Minute bars** (`download_spans`, `load_span`): one download per run of a stock's universe months no more than 3
+  months apart, from 30 sessions before the run (ATR and levels warm up); an existing whole-range cache is reused. A
+  failed or short download is listed and left out. The design run never loads a session after 2024-12-31.
+- **Trades:** levels, sides and minute-level entries from levels.py and breakouts.py (`span_entries`), only on the
+  stock's universe sessions; fills, stops and targets from `breakout_check.replay_all` at 0.1 and 0.25 ATR. `bodies`
+  narrows each one-second bar to its open-close range, a check that lone odd prints don't drive the result.
+- **Costs** (`add_net`): per side 1 bp plus half a cent a share at the unadjusted price (fill x the previous
+  session's unadjusted/adjusted close ratio).
+- **Statistics:** session-clustered means; real minus fake levels by a session bootstrap (`excess`); BH across the
+  10 declared tests; the screen's criteria in `screen`. The account view takes trades one at a time in fill order.
+
+## Month-end rebalancing (`rebalancing.py`)
+
+- **Signal** (`calendar_signal`): at each 15:50 snapshot (dividend-adjusted), the stock weight of a 60/40 SPY/IEF
+  portfolio rebalanced at the previous month's last snapshot, minus 0.60. The first month has no signal.
+- **Trades** (`window_trades`): one per month, entering `entry` sessions from the month's last session L (in the same
+  month) and exiting `exit` sessions from L, short the ETF when stocks are overweight. Slid copies move the window
+  through the month with the signal read at each entry. `reversal_trades` takes the opposite position from L to L+2.
+- **Statistics:** monthly trades don't overlap, so plain Student t intervals; BH across the 8 declared tests.
+
+## Drift after heavy-volume moves (`shock_drift.py`)
+
+- **Universe** (`monthly_universe`): the 300 largest stocks by median dollar volume over the 21 sessions before
+  each month, unadjusted close >= $10.
+- **Events** (`event_table`, `space_events`): AR = close-to-close return minus SPY's; z = AR / its standard deviation
+  over the previous 60 sessions (50 present); volume ratio = volume / the previous 20 sessions' median. |z| >= 3, at
+  most one event per stock in 5 sessions. A test checks that later prices and volumes leave earlier rows unchanged.
+- **Trades** (`trade_returns`): the next session's open to the close of t+h, stock minus SPY, in the direction of
+  the move; costs 1 bp + half a cent a share on the stock and 1 bp on SPY per side. Results ending after the period
+  are dropped. Standard errors are clustered by entry week (month at 20 sessions).
+
+## Into-the-close momentum (`close_momentum.py`, `close_momentum_stocks.py`)
+
+- **Prices** (`day_table`): `intraday_momentum.price_at` at 60, 30 and 15 minutes before the close and at the close;
+  the previous close is the previous session's last-minute close net of a dividend that morning; sd20 = standard
+  deviation of the previous 20 close-to-close moves. A test checks that prices after 15:30 don't change the move to
+  15:30.
+- **Trades** (`trades`, `pick`): on days whose |move| clears the threshold (bps for the ETFs, sd20 units for the
+  stocks), the entry-time price to the last minute's close, signed with the move. ETFs pay 1 bp a side; stocks 1 bp
+  plus half a cent a share. The stocks version uses volatile_breakouts' universe and spans.
+- **Statistics:** session-clustered means; `difference` gives the clustered difference of two groups' means.
+
+## TG Capital's Trident (`trident.py`)
+
+- **Bars** (`thirty_minute_bars`): 30-minute regular-hours bars (80% of minutes), TA-Lib EMA 5/9/13/21/200 and
+  ATR(14) continuous across sessions; `trend_long` = EMA 5 > 9 > 13 > 21 and close > EMA 200 (shorts mirror).
+  `daily_states`: daily EMA 5/9/13/21 over sessions with 80% of their minutes; the bias for a session is the stack
+  at the previous session's close.
+- **Pattern** (`fvg_table`): candle 3 closes at 11:00, 11:30 or 12:00 ET; candles 1-5 consecutive in one session;
+  long gap = candle 3 low - candle 1 high > 0, 50% level its midpoint; doji = candle 4 with body <= 25% of its
+  range, low <= the 50% level and body above it; confirmation = candle 5 close < candle 4 high. Entry at candle 5's
+  close (bar end), stop at candle 1's low. `entries` applies a row of `ROWS` (variants and diagnostics); the limit
+  variant fills at the first minute through the 50% level before 13:00 (at the open if the minute opens through).
+- **Outcomes** (`outcomes`): scans minute bars from the entry, at most 20 sessions after the entry session. A
+  minute that reaches the stop and a target counts as the stop; a stop gapped through exits at the open. The
+  playbook exit closes at the first daily close whose EMAs are not stacked (capped at 120 sessions).
+- **Baseline** (`random_matches`): 20 draws per trade from design sessions of the same ticker and side, at the
+  same ET minute, where the row's filters held at the last bar completed by then; entry at the previous minute's
+  close, stop at the trade's R in 30-minute ATRs. The test is paired: each trade's bracket R minus its draws' mean,
+  clustered by session.
+- **Holdout:** the design run passes only sessions up to 2024-12-31 to `regular_session_minutes`, so no outcome
+  can read 2025 (a test changes 2025 prices and checks nothing moves).
+- **Forex** (`trident_fx.py`): trading days run 17:00 ET to 17:00 ET and are named by the date they end
+  (`fx_sessions`; `fx_minutes` assigns minutes with a 7-hour roll, so Sunday evening is Monday and weekend minutes
+  drop). `trident.run_study` takes the pieces as arguments: `prepare`, `ends` (03:00/03:30/04:00), `last_entry`
+  (06:30), `groups`, `close_stop` (gold: `minute_arrays(bars=...)` puts each 30-minute close on its last minute and
+  `outcomes` exits there) and `spread_of` (median quoted ask - bid in the minute before each as-written entry,
+  cached in `data/cache/fx/spreads.parquet`). `load_fx` caches one file per year; a year that stops more than 4
+  days early raises unless the next 3 weekdays have no bars on Massive either, in which case it is a real gap
+  (NZDUSD late 2020; gold 2010-09 to 2013-07), cached and printed. Gold's study starts 2013-07-15 (`FIRST_DATA`),
+  and every symbol's trades start 60 days after its first minute. Data is cached through `DATA_END` (2026-10-09)
+  so the plan can lapse; the design run never loads a file after 2023.
+- **Forex data quality:** `fx_minutes` drops ET minutes [16:55, 17:10): around the daily roll Massive's bid-built
+  minutes often hold off-market quotes (USDCAD's 16:59 low on 2024-10-04 was 250 pips under the market; in 2010-23,
+  34-48% of NZDUSD and USDCAD minute spikes fell at 16:55-17:15, the rest at news times, which are kept). From
+  2021-01 most minute lows (and some highs) come from a source quoting whole pips 1-2 pips under the other bids
+  (EURUSD 2023: 90% of lows have four decimals against 38% of closes; checked against raw quotes). It is not
+  corrected; `era_section` reports 2010-20 and 2021 on separately.
+- **As traded** (`--as-traded`): `fvg_table(doji_window=4)` takes the first of the next 4 candles that is a doji
+  wicking into the 50% level (body <= 25%, body beyond the level), void once a candle closes beyond the gap's far
+  side; `AS_TRADED_ENDS` lets candle 3 close 3:30-5:00 ET (displacement candle opening 2:30-4:00); `entries` drops
+  entries after `last_entry`. `run_study(exclude=...)` drops his two example days (USDJPY 2024-11-12, USDCAD
+  2024-10-08) from every run. Our data reproduces the USDJPY trade exactly; the USDCAD gap is 0 on Massive's feed
+  (a pip-rounded low) and the daily bias was off.
+- **Green daily candle** (`daily_states` `green_long` / `green_short`, rule key `green`): the previous session's
+  candle closed above (below) its open, applied to the FVG rows and to the random pool alike. It stands in for the
+  BullTrading Easy Scalping colours (closed source); on his USDJPY chart green marked every up candle while the
+  higher-timeframe trend was up. `trident_fx.GREEN` adds it to both forex versions; `green_section` reports it.
 

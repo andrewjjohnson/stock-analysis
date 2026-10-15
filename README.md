@@ -607,8 +607,9 @@ uv run --env-file .env python gap_recovery.py --min-gap 0.25 --out output/gap_re
   the previous close before falling as far again below the entry price? About 50% means no edge.
   A higher fill rate alone is not an edge, because a stock that has already bounced has less ground
   to cover and a closer stop.
-- **Renamed tickers:** sessions Massive files only under a former ticker are filled from it (META's
-  2022-01-31 to 2022-06-08 sessions come from FB).
+- **Renamed tickers:** sessions Massive files only under a former ticker are filled from it, and so is every
+  session before the rename: META's sessions before 2022-06-09 come from FB. (Until 2022-01-28 Massive's META bars
+  are a different security, the Roundhill metaverse ETF at about $13; runs before 2026-10-14 used them.)
 - **Output:** `report.md`, `gaps.csv` (one row per gap), `summary.csv`, `outcomes.png`, `later.png`,
   `filters.png`.
 
@@ -933,6 +934,72 @@ uv run --env-file .env python band_scalp.py --out output/band_scalp
 
 Output (in `design/` or `holdout/`): `report.md`, `stats.csv`, `tests.csv`, `setups.parquet` and `trades.parquet`
 (every setup's and trade's indicator and filter states), `settings.json`, `filters.png`.
+
+## Edge studies with fixed rules and held-back checks
+
+Five studies built the same way: a mechanism first, a fixed list of at most 10 tests with Benjamini-Hochberg
+correction on the 2021-24 design period, baselines, results by year, a related-ticker check, and a one-time
+`--final-test` on 2025-26 that runs only once the held-back rules are written into the script's `FINAL`. Each
+reports its daily-P&L correlation with SPY dip buying and the TSLA breakouts (`portfolio_check.py`).
+- **Universes picked by rule:** `market_daily.py` caches Massive's grouped daily bars (every stock, every session,
+  delisted stocks included) and the list of common stocks and ADRs, so stocks are chosen by rule, not by name.
+- **`volatile_breakouts.py`:** the TSLA breakout rules (stop orders at yesterday's high or low, 0.1 ATR stop and
+  target, one-second fills) on each month's 10 most volatile stocks trading $500M+ a day; costs 1 bp plus half a
+  cent a share per side; fake levels as the baseline; ranks 11-20 as the related set.
+- **`rebalancing.py`:** front-running month-end rebalancing of 60/40 funds: short (or long) SPY, IWM or QQQ over the
+  month's last four sessions when stocks are overweight (underweight) against IEF since the last month-end.
+- **`shock_drift.py`:** after a move of 3+ standard deviations against SPY on 3x normal volume in one of the 300 most
+  traded stocks, trade with the move, hedged with SPY, from the next open for 2, 5 or 20 sessions.
+- **`close_momentum.py` / `close_momentum_stocks.py`:** on days SPY, QQQ or IWM (or one of the month's volatile
+  stocks) has moved a lot by 15:30, trade that direction into the close.
+
+```bash
+uv run --env-file .env python market_daily.py
+uv run --env-file .env python volatile_breakouts.py --out output/volatile_breakouts
+uv run --env-file .env python rebalancing.py --out output/rebalancing
+uv run --env-file .env python shock_drift.py --out output/shock_drift
+uv run --env-file .env python close_momentum.py --out output/close_momentum
+uv run --env-file .env python close_momentum_stocks.py --out output/close_momentum_stocks
+```
+
+Each writes `design/` (or `holdout/`) with `report.md`, the trades, the test table and `settings.json`.
+
+### TG Capital's Trident (`trident.py`)
+
+A Chart Fanatics playbook pattern, built for forex in the London session and tested here on SPY, QQQ, IWM and 12
+mega caps at the New York open: on 30-minute bars, a fair value gap completing at 11:00-12:00 ET, a doji whose
+wick (not body) reaches the gap's midpoint, and a candle closing back below the doji's high (longs; shorts mirror
+it), with EMAs 5/9/13/21 stacked, price on the right side of the 200 EMA and the daily EMAs stacked the same way.
+Entry at the confirmation close, stop at the first FVG candle. It is a signal study in R (entry to stop): how often
+price reaches +1R/+2R/+3R/+5R before the stop, how far it gets, a +2R/-1R bracket, and the playbook's hold-while-
+the-daily-EMAs-stack exit, each against random entries with the same ticker, side, time of day, filters and stop
+size in ATRs. Pre-declared variants and diagnostics (every FVG, no trend filters) are reported for reading.
+
+```bash
+uv run --env-file .env python trident.py --out output/trident                  # design, 2021-11 to 2024-12
+uv run --env-file .env python trident.py --final-test --out output/trident     # 2025-26, once
+```
+
+Writes `design/` (or `holdout/`) with `report.md`, `trades.parquet`, `random.parquet`, `stats.csv`, `tests.csv`,
+`races.png` and `settings.json`.
+
+`trident_fx.py` runs the same study where the playbook trades it: EURUSD, GBPUSD, USDJPY, NZDUSD, USDCAD and gold
+(Massive currency minute bars; needs the Currencies Starter plan), with the London kill zone as written (the FVG's
+third candle closes 3:00-4:00 ET, entries by 6:30 ET), trading days from 17:00 ET, gold's stop on a 30-minute
+close, and the quoted spread at each entry. Design 2010-03 to 2023-12; 2024-01 on is held back. Minutes from 16:55
+to 17:10 ET are dropped (off-market quotes at the daily roll), and from 2021 Massive's minute lows are often a
+pip-rounded bid 1-2 pips under the market, so reports split 2010-2020 from 2021 on. `--as-traded` loosens two
+rules after two of his winning trades: the FVG's big middle candle opens 2:30-4:00 ET, and the doji may be any of
+the next 4 candles (void if a candle closes beyond the gap first). His two example days are left out of every run.
+Both versions also report "+ green daily candle": the previous day closed in the trade's direction, a stand-in for
+the closed-source BullTrading candle colours he trades by.
+
+```bash
+uv run --env-file .env python trident_fx.py --download-only                  # cache 2010 to the data end, once
+uv run --env-file .env python trident_fx.py --out output/trident_fx          # design
+uv run --env-file .env python trident_fx.py --final-test --out output/trident_fx   # 2024-26, once
+uv run --env-file .env python trident_fx.py --as-traded --out output/trident_fx    # as traded, design
+```
 
 ## Output (in `--out`)
 
